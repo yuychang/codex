@@ -157,6 +157,9 @@ struct ResponseCompletedInputTokensDetails {
 
 #[derive(Debug, Deserialize)]
 struct ResponseCompletedOutputTokensDetails {
+    // Some Responses-compatible gateways (e.g. Claude behind AMD's) report
+    // `thinking_tokens` or omit the field entirely.
+    #[serde(default, alias = "thinking_tokens")]
     reasoning_tokens: i64,
 }
 
