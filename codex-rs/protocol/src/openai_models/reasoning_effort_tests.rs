@@ -50,3 +50,25 @@ fn preserves_native_efforts_and_translates_persistent_mode() {
         ReasoningEffort::Custom("disabled".to_string()),
     );
 }
+
+#[test]
+fn unsupported_efforts_use_the_advertised_model_default() {
+    let mut model = test_model(/*spec*/ None);
+    model.default_reasoning_level = Some(ReasoningEffort::Low);
+    model.supported_reasoning_levels = vec![ReasoningEffortPreset {
+        effort: ReasoningEffort::Low,
+        description: String::new(),
+    }];
+    assert_eq!(
+        model.resolve_reasoning_effort(ReasoningEffort::None),
+        ReasoningEffort::Low
+    );
+    assert_eq!(
+        model.resolve_reasoning_effort(ReasoningEffort::High),
+        ReasoningEffort::Low
+    );
+    assert_eq!(
+        model.resolve_reasoning_effort(ReasoningEffort::Low),
+        ReasoningEffort::Low
+    );
+}
