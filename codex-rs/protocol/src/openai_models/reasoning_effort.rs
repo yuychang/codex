@@ -35,6 +35,23 @@ impl ModelInfo {
                 .unwrap_or(ReasoningEffort::Medium),
             // Keep "persistent" in local settings; the Responses API calls it "disabled".
             ReasoningEffort::Persistent => ReasoningEffort::Custom("disabled".to_string()),
+            effort
+                if !self.supported_reasoning_levels.is_empty()
+                    && !self
+                        .supported_reasoning_levels
+                        .iter()
+                        .any(|preset| preset.effort == effort) =>
+            {
+                self.default_reasoning_level
+                    .as_ref()
+                    .filter(|default| {
+                        self.supported_reasoning_levels
+                            .iter()
+                            .any(|preset| &preset.effort == *default)
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| self.supported_reasoning_levels[0].effort.clone())
+            }
             effort => effort,
         }
     }
