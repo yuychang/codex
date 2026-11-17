@@ -476,6 +476,9 @@ impl App {
                     }
                 }
             }
+            AppEvent::StatuslineRead(event) => {
+                self.chat_widget.handle_statusline_read(event, app_server);
+            }
             AppEvent::TaskToolsAvailable { thread_id } => {
                 app_server.remember_task_tool_thread(thread_id);
             }
@@ -655,7 +658,10 @@ impl App {
                     Err(err) => return Err(err),
                 }
             }
-            AppEvent::ResumeBackendSession(_) | AppEvent::CycleNewConversationBackend => {
+            AppEvent::ResumeBackendSession(_)
+            | AppEvent::CycleNewConversationBackend
+            | AppEvent::ChooseCloudEnvironment
+            | AppEvent::StartCloudConversation { .. } => {
                 unreachable!("backend selection is handled by the session manager")
             }
             AppEvent::ArchiveCurrentThread => {
@@ -1651,10 +1657,10 @@ impl App {
                         elicitation_target: None,
                     });
             }
-            AppEvent::AccountEmailLoaded { request_id, email, workspace } => {
+            AppEvent::AccountEmailLoaded { request_id, email, workspace, plan_type } => {
                 if self.account_email_request_id == Some(request_id) {
                     self.account_email_request_id = None;
-                    self.chat_widget.on_account_email_loaded(email, workspace);
+                    self.chat_widget.on_account_email_loaded(email, workspace, plan_type);
                 }
             }
             AppEvent::SecuritySetupLoaded { request_id, identity, notice } => {
@@ -2108,7 +2114,12 @@ impl App {
                 }
             }
             AppEvent::RefreshRateLimits { origin } => {
-                self.refresh_rate_limits(app_server, origin);
+                // A queued recovery can outlive the chat's ChatGPT account.
+                if origin != RateLimitRefreshOrigin::Recovery
+                    || self.chat_widget.has_chatgpt_account()
+                {
+                    self.refresh_rate_limits(app_server, origin);
+                }
             }
             AppEvent::ApplyBackendBannerFallback { thread_id } => {
                 if self.active_thread_id == Some(thread_id)
@@ -2209,7 +2220,12 @@ impl App {
                         self.chat_widget.apply_usage_notice_read(request_id);
                         self.chat_widget.update_backend_banner(&response);
                         self.apply_backend_banner_fallback(app_server).await;
-                        app_server_rate_limit_snapshots(response)
+                        let snapshots = app_server_rate_limit_snapshots(response);
+                        // The account can outlive the popup or chat that requested this read.
+                        for snapshot in &snapshots {
+                            self.chat_widget.observe_quota_plan(snapshot);
+                        }
+                        snapshots
                     } else {
                         Vec::new()
                     };
