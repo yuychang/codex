@@ -1,0 +1,83 @@
+{
+  "verified_at": "2026-11-17",
+  "models": {
+    "GPT-6.1-Terra": {
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "gpt-6.1-sol": {
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "gpt-6-astra": {
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "gpt-6-luna": {
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "Kimi-K3.1-Pro": {
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    "DeepSeek-V4-Pro": {
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        "none",
+        "high",
+        "max"
+      ]
+    },
+    "DeepSeek-V4.1-Flash": {
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        "none",
+        "high",
+        "max"
+      ]
+    },
+    "Qwen3.8-Flash-Next": {
+      "default_reasoning_level": "xhigh",
+      "supported_reasoning_levels": [
+        "low",
+        "medium",
+        "xhigh"
+      ]
+    }
+  }
+}
