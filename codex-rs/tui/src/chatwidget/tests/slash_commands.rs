@@ -2558,6 +2558,17 @@ async fn slash_keymap_debug_can_inspect_app_shortcuts() {
 }
 
 #[tokio::test]
+async fn slash_rc_arguments_direct_user_to_menu() {
+    let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    submit_composer_text(&mut chat, "/rc stop");
+
+    let [cell]: [_; 1] = drain_insert_history(&mut rx).try_into().expect("one cell");
+    insta::assert_snapshot!(lines_to_single_string(&cell), @"■ Open /rc and choose Disable to turn off remote control.");
+    assert!(op_rx.try_recv().is_err(), "expected no agent turn");
+}
+
+#[tokio::test]
 async fn slash_keymap_invalid_args_show_usage() {
     let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
@@ -3378,6 +3389,11 @@ async fn slash_pwd_and_cwd_alias_display_current_working_directory_from_composer
     let mut output = Vec::new();
     for (command, side) in [("/pwd", false), ("/cwd", true), ("/pwd x", false)] {
         let (mut chat, mut rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+        if side {
+            chat.current_cwd =
+                PathUri::try_from(LegacyAppPathString::from_string(r"D:\workspace\remote"))
+                    .expect("absolute server path");
+        }
         chat.set_side_conversation_active(side);
         chat.bottom_pane.set_task_running(!side);
         chat.bottom_pane
@@ -3389,7 +3405,7 @@ async fn slash_pwd_and_cwd_alias_display_current_working_directory_from_composer
     }
     insta::assert_snapshot!(output.join(""), @r"
 • Current working directory: /tmp/project
-• Current working directory: /tmp/project
+• Current working directory: D:\workspace\remote
 ■ Usage: /pwd
 ");
 }

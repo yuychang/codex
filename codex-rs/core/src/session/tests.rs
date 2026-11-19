@@ -1014,6 +1014,7 @@ async fn preview_session_start_hooks(
         },
         thread_id,
         Arc::new(CoreHookMcpExecutor {
+            session: Default::default(),
             runtime: Arc::new(McpRuntime::empty(config.prefix_mcp_tool_names())),
             thread_id,
         }),
@@ -2822,6 +2823,7 @@ async fn annotated_history_uses_explicit_model_without_a_step(
         metadata.history_sequence = Some(index as u64 + 1);
         metadata.sampled_through_sequence = Some(0);
         metadata.history_truncation_token_limit = Some(expected_budget);
+        metadata.model_search_state = Some(codex_history::ModelSearchState::Unused);
         let (ResponseItem::FunctionCallOutput { output, .. }
         | ResponseItem::CustomToolCallOutput { output, .. }) = &mut envelope.item
         else {
@@ -5644,6 +5646,7 @@ async fn active_profile_update_rebuilds_network_proxy_config(
             (
                 "locked-down".to_string(),
                 PermissionProfileToml {
+                    credentials: None,
                     description: None,
                     extends: None,
                     workspace_roots: None,
@@ -5660,6 +5663,7 @@ async fn active_profile_update_rebuilds_network_proxy_config(
             (
                 "web-enabled".to_string(),
                 PermissionProfileToml {
+                    credentials: None,
                     description: None,
                     extends: None,
                     workspace_roots: None,
@@ -6950,6 +6954,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         },
         thread_id,
         Arc::new(CoreHookMcpExecutor {
+            session: Default::default(),
             runtime: Arc::clone(&mcp_runtime),
             thread_id,
         }),
@@ -7065,6 +7070,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         parent_observer_event_tx: OnceLock::new(),
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        initial_context_publication: Semaphore::new(/*permits*/ 1),
         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
         code_mode_message_tasks: Default::default(),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
@@ -9305,6 +9311,7 @@ where
         },
         thread_id,
         Arc::new(CoreHookMcpExecutor {
+            session: Default::default(),
             runtime: Arc::clone(&mcp_runtime),
             thread_id,
         }),
@@ -9420,6 +9427,7 @@ where
         parent_observer_event_tx: OnceLock::new(),
         agent_status: agent_status_tx,
         state: Mutex::new(state),
+        initial_context_publication: Semaphore::new(/*permits*/ 1),
         thread_settings_persistence: Semaphore::new(/*permits*/ 1),
         code_mode_message_tasks: Default::default(),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),

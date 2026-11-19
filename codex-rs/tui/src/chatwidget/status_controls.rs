@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::bottom_pane::StatusLine;
+use crate::bottom_pane::terminal_title_setup;
 use crate::status::thread_cost_micros;
 
 impl ChatWidget {
@@ -81,6 +82,10 @@ impl ChatWidget {
             StatusDetailsCapitalization::CapitalizeFirst,
             STATUS_DETAILS_DEFAULT_MAX_LINES,
         )
+    }
+
+    pub(crate) fn status_line_area(&self) -> ratatui::layout::Rect {
+        self.bottom_pane.status_line_area()
     }
 
     /// Sets the currently rendered footer status-line value.
@@ -328,10 +333,23 @@ impl ChatWidget {
     }
 
     pub(super) fn open_status_line_setup(&mut self) {
+        use crate::bottom_pane::StatuslineProviderActions;
+
         let configured_status_line_items = self.configured_status_line_items();
+        let providers = if !self.custom_statusline_enabled() {
+            StatuslineProviderActions::Hidden
+        } else if self.thread_params_mode == crate::ThreadParamsMode::Cloud {
+            StatuslineProviderActions::Choose
+        } else {
+            StatuslineProviderActions::CreateAndChoose {
+                backend: self.model_catalog.backend,
+                thread_id: self.thread_id(),
+            }
+        };
         let view = StatusLineSetupView::new(
             Some(configured_status_line_items.as_slice()),
             self.local_settings.tui.status_line_use_colors,
+            providers,
             self.status_surface_preview_data(),
             self.app_event_tx.clone(),
             self.bottom_pane.list_keymap(),
@@ -343,7 +361,7 @@ impl ChatWidget {
         let configured_terminal_title_items = self.configured_terminal_title_items();
         self.terminal_title_setup_original_items =
             Some(self.local_settings.tui.terminal_title.clone());
-        let view = TerminalTitleSetupView::new(
+        let view = terminal_title_setup(
             Some(configured_terminal_title_items.as_slice()),
             self.terminal_title_preview_data(),
             self.app_event_tx.clone(),

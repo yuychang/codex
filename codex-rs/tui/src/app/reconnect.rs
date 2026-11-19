@@ -304,6 +304,9 @@ impl App {
             self.agents_overview.pending_pin_change = None;
             self.agents_overview.pending_usage = None;
             self.agents_overview.usage_disabled = false;
+            self.statusline_picker = None;
+            self.chat_widget
+                .dismiss_provider_view(super::statusline_picker::PICKER);
             self.reconnect.presentation = if self
                 .chat_widget
                 .selected_index_for_active_view(agents_overview::AGENTS_OVERVIEW_VIEW_ID)
@@ -356,6 +359,7 @@ impl App {
     ) {
         self.chat_widget.snapshot_local_images = self.app_server_target.uses_remote_workspace();
         self.chat_widget.thread_params_mode = app_server.thread_params_mode();
+        self.chat_widget.app_server_path_convention = app_server.path_convention();
         self.chat_widget.pending_cloud_turn_settings = app_server.pending_cloud_turn_settings();
         self.chat_widget.set_local_worktree_operations(
             !crate::uses_remote_workspace_or_environment(
@@ -416,6 +420,7 @@ impl App {
         *app_event_rx = rx;
         for pane in self.sidebars.values_mut() {
             pane.focus_document_request = None;
+            pane.agents.pending_link = None;
             for doc in pane.documents.values_mut() {
                 doc.connection_replaced();
             }
@@ -562,6 +567,11 @@ impl App {
                 self.agent_navigation.mark_stopped(id);
             }
             if self.primary_thread_id == Some(id) {
+                self.restore_sidebar_agent_outcomes(
+                    id,
+                    &started.turns,
+                    super::sidebar_subagents::OutcomeReplay::Reconnect,
+                );
                 self.primary_session_configured = Some(started.session.clone());
             }
             if started.blocks_direct_input {

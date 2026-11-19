@@ -6,12 +6,14 @@ use crate::app_server_session::ThreadParamsMode;
 use crate::bottom_pane::StatusLineFocus;
 use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
 use crate::chatwidget::tests::render_bottom_popup;
+use crate::statusline_metrics::tests::Collector;
 use codex_app_server_client::AppServerClient;
 use codex_app_server_client::CloudClient;
 use codex_app_server_client::CloudCommand;
 use codex_app_server_client::CloudOperation;
 use codex_app_server_client::RequestResult;
 use codex_app_server_protocol::ClientRequest;
+use codex_app_server_protocol::McpResourceContent;
 use codex_config::types::BuiltinStatusLine;
 use pretty_assertions::assert_eq;
 use ratatui::buffer::Buffer;
@@ -31,20 +33,22 @@ fn statusline_resource_requires_one_matching_json_text_item() {
         decode_tree(uri, std::slice::from_ref(&item)).unwrap(),
         UiTree(None)
     );
-    for contents in [
-        vec![],
-        vec![item.clone(), item],
-        vec![content(
-            json!({"uri":"ui://wrong","mimeType":"application/json","text":"null"}),
-        )],
-        vec![content(json!({"uri":uri,"text":"null"}))],
-        vec![content(
-            json!({"uri":uri,"mimeType":"application/json","blob":"bnVsbA=="}),
-        )],
-        vec![text("text/plain", "null")],
-        vec![text("application/json", "{")],
+    let wrong_uri =
+        content(json!({"uri":"ui://wrong","mimeType":"application/json","text":"null"}));
+    let blob = content(json!({"uri":uri,"mimeType":"application/json","blob":"bnVsbA=="}));
+    for (contents, expected) in [
+        (vec![], ReadIssue::Envelope),
+        (vec![item.clone(), item], ReadIssue::Envelope),
+        (vec![wrong_uri], ReadIssue::Uri),
+        (
+            vec![content(json!({"uri":uri,"text":"null"}))],
+            ReadIssue::Mime,
+        ),
+        (vec![blob], ReadIssue::Envelope),
+        (vec![text("text/plain", "null")], ReadIssue::Mime),
+        (vec![text("application/json", "{")], ReadIssue::Tree),
     ] {
-        assert!(decode_tree(uri, &contents).is_err());
+        assert_eq!(decode_tree(uri, &contents).unwrap_err(), expected);
     }
 }
 
@@ -82,7 +86,7 @@ async fn custom_statusline_requests_headline_and_billing_with_no_native_items() 
             server: "fixture".into(),
             tool: "line".into(),
         })));
-    chat.set_feature_enabled(Feature::TuiExtensionsStatusLine, /*enabled*/ true);
+    chat.statusline_feature_enabled = true;
     chat.refresh_status_line();
 
     let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
@@ -107,14 +111,13 @@ async fn statusline_reader_waits_for_the_displayed_thread_and_keeps_its_result()
     chat.local_settings.tui.status_line = Some(Vec::new());
     chat.thread_id = Some(ThreadId::new());
     chat.local_settings.tui.status_line_provider = Some(selected.clone());
-    chat.set_feature_enabled(Feature::TuiExtensionsStatusLine, /*enabled*/ false);
     chat.refresh_status_line();
     assert!(read_events(&mut rx).is_empty());
 
     chat.local_settings.tui.status_line_provider = Some(Box::new(StatusLineSelection::Builtin(
         BuiltinStatusLine::Default,
     )));
-    chat.set_feature_enabled(Feature::TuiExtensionsStatusLine, /*enabled*/ true);
+    chat.statusline_feature_enabled = true;
     chat.refresh_status_line();
     assert!(read_events(&mut rx).is_empty());
     chat.thread_id = None;
@@ -133,14 +136,22 @@ async fn statusline_reader_waits_for_the_displayed_thread_and_keeps_its_result()
         token,
         step: ReadStep::Finished(server.backend_id(), Ok(UiTree(root))),
     };
-    chat.handle_statusline_read(finish(token, Some(UiNode::String("Ready".into()))), &server);
+    let collector = Collector::new();
+    let mut app_config = chat.config.clone();
+    let metrics = collector.metrics(&mut app_config);
+    chat.handle_statusline_read(
+        finish(token, Some(UiNode::String("Ready".into()))),
+        &server,
+        &metrics,
+        &app_config,
+    );
     chat.refresh_status_line();
     let ready = footer(&chat).unwrap();
     insta::assert_snapshot!(format!("{initializing}\n{ready}"), @"
     Initializing…
     Ready
     ");
-    chat.handle_statusline_read(finish(token, /*root*/ None), &server);
+    chat.handle_statusline_read(finish(token, /*root*/ None), &server, &metrics, &app_config);
     chat.refresh_status_line();
     assert_eq!(footer(&chat).as_deref(), Some(""));
     assert!(!render_bottom_popup(&chat, /*width*/ 80).contains("native-agent-label"));
@@ -153,16 +164,16 @@ async fn statusline_reader_waits_for_the_displayed_thread_and_keeps_its_result()
     chat.read_only_history = false;
     chat.refresh_status_line();
     let [resumed] = read_events(&mut rx).try_into().unwrap();
-    chat.handle_statusline_read(finish(token, None), &server);
+    chat.handle_statusline_read(finish(token, /*root*/ None), &server, &metrics, &app_config);
     assert_eq!(footer(&chat).as_deref(), Some("Initializing…"));
     let token = resumed.token;
     chat.primary_environment_cwd = Some(crate::session_state::EnvironmentCwd {
-        path: LegacyAppPathString::from_path(chat.config.cwd.join("executor-checkout").as_path()),
+        path: chat.config.cwd.join("executor-checkout").into(),
         is_server_local: false,
     });
     chat.refresh_status_line();
     assert!(read_events(&mut rx).is_empty());
-    chat.current_cwd = Some(chat.config.cwd.join("another-project").to_path_buf());
+    chat.current_cwd = chat.config.cwd.join("another-project").into();
     let (reply, snapshot) = oneshot::channel();
     chat.handle_statusline_read(
         StatuslineReadEvent {
@@ -170,6 +181,8 @@ async fn statusline_reader_waits_for_the_displayed_thread_and_keeps_its_result()
             step: ReadStep::Snapshot(server.backend_id(), reply),
         },
         &server,
+        &metrics,
+        &app_config,
     );
     assert!(snapshot.await.is_err());
     let [replacement] = read_events(&mut rx).try_into().unwrap();
@@ -180,14 +193,20 @@ async fn statusline_reader_waits_for_the_displayed_thread_and_keeps_its_result()
     chat.handle_statusline_read(
         finish(token, Some(UiNode::String("retired".into()))),
         &server,
+        &metrics,
+        &app_config,
     );
     assert_eq!(footer(&chat).as_deref(), Some("Initializing…"));
+    assert!(collector.snapshot().is_empty());
 }
 
 type Reply = oneshot::Sender<std::io::Result<RequestResult>>;
 const URI: &str = "ui://fixture/status";
 
 struct Reader {
+    collector: Collector,
+    app_config: Config,
+    metrics: StatuslineMetrics,
     chat: ChatWidget,
     owner: AppServerSession,
     events: UnboundedReceiver<AppEvent>,
@@ -204,14 +223,20 @@ impl Reader {
             ThreadParamsMode::Cloud,
         );
         chat.thread_id = Some(ThreadId::new());
-        chat.set_feature_enabled(Feature::TuiExtensionsStatusLine, /*enabled*/ true);
+        chat.statusline_feature_enabled = true;
         chat.local_settings.tui.status_line_provider =
             Some(Box::new(StatusLineSelection::Mcp(StatusLineProviderId {
                 server: "fixture".into(),
                 tool: "line".into(),
             })));
         chat.refresh_status_line();
+        let collector = Collector::new();
+        let mut app_config = chat.config.clone();
+        let metrics = collector.metrics(&mut app_config);
         let mut reader = Self {
+            collector,
+            app_config,
+            metrics,
             chat,
             owner,
             events,
@@ -221,10 +246,15 @@ impl Reader {
         reader
     }
 
+    fn handle(&mut self, event: StatuslineReadEvent) {
+        self.chat
+            .handle_statusline_read(event, &self.owner, &self.metrics, &self.app_config);
+    }
+
     async fn dispatch(&mut self) {
         while let Some(event) = self.events.recv().await {
             if let AppEvent::StatuslineRead(event) = event {
-                self.chat.handle_statusline_read(event, &self.owner);
+                self.handle(event);
                 return;
             }
         }
@@ -240,6 +270,10 @@ impl Reader {
     }
 
     async fn resolve(&mut self) {
+        self.resolve_on(&[None, self.chat.thread_id]).await;
+    }
+
+    async fn resolve_on(&mut self, scopes: &[Option<ThreadId>]) {
         let (ClientRequest::ConfigRead { .. }, config) = self.request().await else {
             panic!("expected the selected thread's config");
         };
@@ -249,21 +283,23 @@ impl Reader {
                 json!({"config":layer, "layers":[{"name":{"type":"user"}, "config":layer}]}),
             )))
             .unwrap();
-        for thread in [None, self.chat.thread_id.map(|id| id.to_string())] {
+        for thread in scopes {
             let (ClientRequest::McpServerStatusList { params, .. }, reply) = self.request().await
             else {
                 panic!("expected a selected-server lookup");
             };
             assert_eq!(
                 (params.server_name.as_deref(), params.thread_id),
-                (Some("fixture"), thread)
+                (Some("fixture"), thread.map(|id| id.to_string()))
             );
             let name = &self.chat.selected_statusline_provider().unwrap().tool;
             let tool = json!({"name":name,"title":"Calendar","inputSchema":{},"_meta":{
                 "openai/ui":{"entrypoints":[{"type":"statusline","resourceUri":URI}]}
             }});
-            reply.send(Ok(Ok(json!({"data":[{"name":"fixture","httpOrigin":null,"runtimeStatus":"connected",
-                "tools":{(name):tool},"resources":[],"resourceTemplates":[],"authStatus":"unsupported"}],"nextCursor":null})))).unwrap();
+            let row = crate::statusline_provider::test_support::row("fixture", vec![tool]);
+            reply
+                .send(Ok(Ok(json!({"data":[row],"nextCursor":null}))))
+                .unwrap();
         }
     }
 
@@ -339,6 +375,7 @@ async fn statusline_polls_one_second_after_completion_including_empty_content() 
     advance(/*millis*/ 1).await;
     let _third = reader.read(URI).await;
     assert_eq!(completed.elapsed(), Duration::from_secs(1));
+    assert_eq!(reader.collector.snapshot(), ["provider_started 1"]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -355,10 +392,15 @@ async fn statusline_invalid_content_stops_polling_immediately() {
     respond(invalid, "{");
     reader.dispatch().await;
     assert_eq!(failed.elapsed(), Duration::ZERO);
-    insta::assert_snapshot!(footer(&reader.chat).unwrap(), @"Error loading statusline contents from Calendar. Use /statusline to (re)select your provider and try again.");
+    insta::assert_snapshot!(footer(&reader.chat).unwrap(), @"Status line failed · /statusline");
+    assert!(!reader.chat.provider_needs_snapshot());
     reader.chat.refresh_status_line();
     advance(/*millis*/ 60_000).await;
     reader.assert_idle();
+    assert_eq!(
+        reader.collector.snapshot(),
+        ["provider_failed kind=error 1", "provider_started 1"]
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -370,14 +412,15 @@ async fn statusline_rpc_error_stops_polling_immediately() {
     assert_eq!(resolved.elapsed(), Duration::ZERO);
     let failed = Instant::now();
     reply
-        .send(Err(std::io::Error::other("provider disconnected")))
+        .send(Err(std::io::Error::other(
+            "PRIVATE provider error and account data",
+        )))
         .unwrap();
     reader.dispatch().await;
     assert_eq!(failed.elapsed(), Duration::ZERO);
-    assert!(
-        footer(&reader.chat)
-            .unwrap()
-            .contains("Error loading statusline contents from Calendar")
+    assert_eq!(
+        footer(&reader.chat).as_deref(),
+        Some("Status line failed · /statusline")
     );
     advance(/*millis*/ 60_000).await;
     reader.assert_idle();
@@ -429,10 +472,9 @@ async fn statusline_deadline_wins_when_a_late_reply_is_already_queued() {
     assert!(futures::poll!(&mut advance).is_pending());
     respond(reply, r#""too late""#);
     reader.dispatch().await;
-    assert!(
-        footer(&reader.chat)
-            .unwrap()
-            .contains("Error loading statusline contents from Calendar")
+    assert_eq!(
+        footer(&reader.chat).as_deref(),
+        Some("Status line timed out · /statusline")
     );
 }
 
@@ -447,14 +489,19 @@ async fn statusline_hung_read_stops_polling_after_one_second() {
     advance(/*millis*/ 1).await;
     reader.dispatch().await;
     assert_eq!(started.elapsed(), Duration::from_secs(1));
-    assert!(
-        footer(&reader.chat)
-            .unwrap()
-            .contains("Error loading statusline contents from Calendar")
+    assert_eq!(
+        footer(&reader.chat).as_deref(),
+        Some("Status line timed out · /statusline")
     );
     assert!(held.is_closed());
+    reader.chat.local_settings.tui.status_line_provider = None;
+    reader.chat.refresh_status_line();
     advance(/*millis*/ 60_000).await;
     reader.assert_idle();
+    assert_eq!(
+        reader.collector.snapshot(),
+        ["provider_failed kind=timeout 1", "provider_started 1"]
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -469,15 +516,45 @@ async fn statusline_startup_timeout_stops_before_the_first_read() {
     advance(/*millis*/ 1).await;
     reader.dispatch().await;
     assert_eq!(started.elapsed(), Duration::from_secs(5));
-    assert!(
-        footer(&reader.chat)
-            .unwrap()
-            .contains("Error loading statusline contents from line")
+    assert_eq!(
+        footer(&reader.chat).as_deref(),
+        Some("Status line timed out · /statusline")
     );
     assert!(held.is_closed());
     reader.chat.refresh_status_line();
     advance(/*millis*/ 60_000).await;
     reader.assert_idle();
+    assert_eq!(
+        reader.collector.snapshot(),
+        ["provider_failed kind=timeout 1", "provider_started 1"]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn statusline_hung_retry_reports_the_remaining_startup_deadline() {
+    let mut reader = Reader::new().await;
+    let started = Instant::now();
+    let (_, first) = reader.request().await;
+    first
+        .send(Err(std::io::Error::other("private config error")))
+        .unwrap();
+    advance(/*millis*/ 2_000).await;
+    reader
+        .chat
+        .statusline_read
+        .as_ref()
+        .unwrap()
+        .server_ready("fixture");
+    let (ClientRequest::ConfigRead { .. }, held) = reader.request().await else {
+        panic!("expected a retry after the selected server became ready");
+    };
+    advance(/*millis*/ 3_000).await;
+    reader.dispatch().await;
+    assert!(held.is_closed());
+    assert_eq!(started.elapsed(), LOOKUP_TIMEOUT);
+    insta::assert_snapshot!(
+        footer(&reader.chat).unwrap(), @"Status line timed out · /statusline"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -523,15 +600,14 @@ async fn statusline_changing_provider_or_reconnecting_discards_the_previous_read
         reader.resolve().await;
         let next = reader.read(URI).await;
         held.closed().await;
-        for result in [Ok(UiTree(None)), Err("retired".into())] {
+        for result in [Ok(UiTree(None)), Err(Failure::Snapshot)] {
             let step = ReadStep::Finished(reader.owner.backend_id(), result);
-            reader
-                .chat
-                .handle_statusline_read(StatuslineReadEvent { token: old, step }, &reader.owner);
+            reader.handle(StatuslineReadEvent { token: old, step });
         }
         assert_eq!(footer(&reader.chat).as_deref(), Some("Initializing…"));
         held = next;
     }
+    assert_eq!(reader.collector.snapshot(), ["provider_started 3"]);
 }
 
 #[tokio::test(start_paused = true)]
@@ -543,16 +619,28 @@ async fn statusline_explicit_reselection_restarts_a_failed_reader() {
     reader.dispatch().await;
     reader.chat.refresh_status_line();
     reader.assert_idle();
-    assert!(
-        footer(&reader.chat)
-            .unwrap()
-            .contains("Error loading statusline contents from Calendar")
+    assert_eq!(
+        footer(&reader.chat).as_deref(),
+        Some("Status line timed out · /statusline")
     );
 
-    reader.chat.reselect_statusline_provider();
+    // An explicit choice can arrive while the displayed thread is starting.
+    let thread = reader.chat.thread_id.take();
+    let provider = crate::statusline_provider::test_support::advertised(
+        "fixture",
+        "line",
+        "ui://global/footer",
+    );
+    reader.chat.reselect_statusline_provider(Some(provider));
+    reader.chat.thread_id = thread;
+    reader.chat.refresh_status_line();
     reader.dispatch().await;
-    reader.resolve().await;
+    reader.resolve_on(&[reader.chat.thread_id]).await;
     respond(reader.read(URI).await, r#""restored""#);
     reader.dispatch().await;
     assert_eq!(footer(&reader.chat).as_deref(), Some("restored"));
+    assert_eq!(
+        reader.collector.snapshot(),
+        ["provider_failed kind=timeout 1", "provider_started 2"]
+    );
 }

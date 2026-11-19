@@ -226,7 +226,19 @@ pub struct ConversationStartParams {
     pub voice: Option<Option<RealtimeVoice>>,
 }
 
-/// Controls when an in-process realtime attachment may establish a connection.
+/// Authentication selected by the embedding host for an existing call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RealtimeExistingCallAuth {
+    /// Use the model provider's authentication and runtime destination checks.
+    #[default]
+    ModelProvider,
+    /// Use the selected auth manager's external headers and the host's transport.
+    /// The trusted host must authorize the destination, call owner, and calling
+    /// workload before selecting this mode. Never derive it from a client URL.
+    ExternalHeaders,
+}
+
+/// Controls connection admission and authentication for an in-process attachment.
 #[derive(Debug, Clone, Default)]
 pub struct RealtimeAttachmentOptions {
     /// Set the watch to `true` to cancel a pending connection.
@@ -234,6 +246,8 @@ pub struct RealtimeAttachmentOptions {
     pub cancel: Option<watch::Receiver<bool>>,
     /// Optional caller deadline for publishing the connection. Cleanup can finish later.
     pub start_before: Option<SystemTime>,
+    /// Applies only to existing calls; external headers require an explicit host-selected URL.
+    pub existing_call_auth: RealtimeExistingCallAuth,
 }
 
 /// A caller-owned realtime sideband. Dropping either direction seals input and ends
@@ -775,7 +789,13 @@ pub enum Op {
     /// Close the running realtime conversation stream.
     RealtimeConversationClose,
 
-    /// Close only the matching session after earlier start operations finish.
+    /// End the identified logical call, including after its transport owner is lost.
+    RealtimeConversationEnd {
+        realtime_session_id: String,
+        reply: oneshot::Sender<CodexResult<()>>,
+    },
+
+    /// Disconnect only the matching transport after earlier start operations finish.
     RealtimeConversationDetach {
         realtime_session_id: String,
         reply: oneshot::Sender<CodexResult<()>>,
@@ -1137,6 +1157,7 @@ impl Op {
             Self::RealtimeConversationText(_) => "realtime_conversation_text",
             Self::RealtimeConversationSpeech(_) => "realtime_conversation_speech",
             Self::RealtimeConversationClose => "realtime_conversation_close",
+            Self::RealtimeConversationEnd { .. } => "realtime_conversation_end",
             Self::RealtimeConversationDetach { .. } => "realtime_conversation_detach",
             Self::RealtimeConversationListVoices => "realtime_conversation_list_voices",
             Self::RecoverTurn { .. } => "recover_turn",
@@ -2099,6 +2120,9 @@ pub enum CodexErrorInfo {
     ContextWindowExceeded,
     SessionBudgetExceeded,
     UsageLimitExceeded,
+    ApiKeySpendLimitExceeded,
+    ProjectSpendLimitExceeded,
+    OrganizationSpendLimitExceeded,
     RateLimitExceeded,
     FlexUnavailable,
     ServerOverloaded,
@@ -2142,6 +2166,16 @@ pub enum CodexErrorInfo {
 }
 
 impl CodexErrorInfo {
+    pub fn is_usage_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::UsageLimitExceeded
+                | Self::ApiKeySpendLimitExceeded
+                | Self::ProjectSpendLimitExceeded
+                | Self::OrganizationSpendLimitExceeded
+        )
+    }
+
     /// Whether this error should mark the current turn as failed when replaying history.
     pub fn affects_turn_status(&self) -> bool {
         match self {
@@ -2149,6 +2183,9 @@ impl CodexErrorInfo {
             Self::ContextWindowExceeded
             | Self::SessionBudgetExceeded
             | Self::UsageLimitExceeded
+            | Self::ApiKeySpendLimitExceeded
+            | Self::ProjectSpendLimitExceeded
+            | Self::OrganizationSpendLimitExceeded
             | Self::RateLimitExceeded
             | Self::FlexUnavailable
             | Self::ServerOverloaded
@@ -2710,7 +2747,7 @@ impl FromStr for RateLimitReachedType {
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, JsonSchema, TS)]
 pub struct RateLimitWindow {
-    /// Percentage (0-100) of the window that has been consumed.
+    /// Percentage of the allowance consumed during the window. Can exceed 100.
     pub used_percent: f64,
     /// Rolling window duration, in minutes.
     #[ts(type = "number | null")]

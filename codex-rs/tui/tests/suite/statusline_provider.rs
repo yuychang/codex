@@ -99,7 +99,7 @@ async fn statusline_reads_the_selected_stdio_resource_on_the_displayed_thread() 
         }
         fs::write(&barrier, "")?;
         if mode == Setup::ProjectShadow {
-            terminal.wait_for_screen("Error loading statusline contents from sandbox_meta")?;
+            terminal.wait_for_screen("Status line unavailable · /statusline")?;
             assert!(!receipt.exists());
             assert!(!shadow.exists());
         } else {
@@ -132,13 +132,27 @@ async fn statusline_reads_the_selected_stdio_resource_on_the_displayed_thread() 
                 terminal.write_input(b"/raw off\r")?;
                 terminal.wait_for_screen("Raw output mode off")?;
                 terminal.wait_for_screen(&format!("Provider thread {thread} (standard)"))?;
-                let config = fs::read_to_string(&local_config)?;
-                fs::write(
-                    &local_config,
-                    config.replace("tool='sandbox_meta'", "tool='replacement'"),
-                )?;
+                terminal.write_input(b"/statusline\r")?;
+                terminal.wait_for_screen("Choose a status line provider")?;
+                for row in ["Default status line", "fixture / sandbox_meta"] {
+                    terminal.write_input(b"\r")?;
+                    terminal.wait_for_screen(row)?;
+                    terminal.write_input(b"2")?;
+                    terminal.wait_for_screen("Configure Status Line")?;
+                }
+                terminal.write_input(b"\x1b")?;
+                terminal.wait_for_screen(&format!("Provider thread {thread} (standard)"))?;
+
+                let mut config: toml::Value = toml::from_str(&fs::read_to_string(&local_config)?)?;
+                assert_eq!(
+                    config["tui"]["status_line_provider"]["tool"].as_str(),
+                    Some("sandbox_meta")
+                );
+                config["tui"]["status_line_provider"]["tool"] =
+                    toml::Value::String("replacement".into());
+                fs::write(&local_config, toml::to_string(&config)?)?;
                 terminal.write_input(b"/new\r")?;
-                terminal.wait_for_screen("Error loading statusline contents from replacement")?;
+                terminal.wait_for_screen("Status line unavailable · /statusline")?;
             }
             assert_eq!(state["thread"]["workspace"], json!({"cwd": cwd}));
         }

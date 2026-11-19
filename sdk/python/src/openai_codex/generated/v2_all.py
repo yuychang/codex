@@ -95,6 +95,11 @@ class AccountTokenUsageSummary(BaseModel):
     peak_daily_tokens: Annotated[int | None, Field(alias="peakDailyTokens")] = None
 
 
+class AccountUpdateReason(Enum):
+    workspace_routing_ready = "workspaceRoutingReady"
+    unknown = "unknown"
+
+
 class ActivePermissionProfile(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -256,14 +261,6 @@ class AppToolApproval(Enum):
     prompt = "prompt"
     writes = "writes"
     approve = "approve"
-
-
-class AppToolConfig(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    approval_mode: AppToolApproval | None = None
-    enabled: bool | None = None
 
 
 class AppToolSummary(BaseModel):
@@ -575,12 +572,16 @@ class CodexErrorInfoValue(str, Enum):
     context_window_exceeded = "contextWindowExceeded"
     session_budget_exceeded = "sessionBudgetExceeded"
     usage_limit_exceeded = "usageLimitExceeded"
+    api_key_spend_limit_exceeded = "apiKeySpendLimitExceeded"
+    project_spend_limit_exceeded = "projectSpendLimitExceeded"
+    organization_spend_limit_exceeded = "organizationSpendLimitExceeded"
     rate_limit_exceeded = "rateLimitExceeded"
     flex_unavailable = "flexUnavailable"
     server_overloaded = "serverOverloaded"
     model_not_found = "modelNotFound"
     policy_capacity_unavailable = "policyCapacityUnavailable"
     cyber_policy = "cyberPolicy"
+    bio_policy = "bioPolicy"
     misalignment_policy_violation = "misalignmentPolicyViolation"
     too_many_denials = "tooManyDenials"
     internal_server_error = "internalServerError"
@@ -2416,6 +2417,10 @@ class AmazonBedrockLoginAccountParams(BaseModel):
         populate_by_name=True,
     )
     api_key: Annotated[str, Field(alias="apiKey")]
+    provider_id: Annotated[
+        BedrockProviderId | None,
+        Field(alias="providerId", description="Defaults to Amazon Bedrock Mantle when omitted."),
+    ] = None
     region: str
     type: Annotated[
         Literal["amazonBedrock"], Field(title="AmazonBedrockv2::LoginAccountParamsType")
@@ -2427,6 +2432,10 @@ class AmazonBedrockAccessKeysLoginAccountParams(BaseModel):
         populate_by_name=True,
     )
     access_key_id: Annotated[str, Field(alias="accessKeyId")]
+    provider_id: Annotated[
+        BedrockProviderId | None,
+        Field(alias="providerId", description="Defaults to Amazon Bedrock Mantle when omitted."),
+    ] = None
     region: str
     secret_access_key: Annotated[str, Field(alias="secretAccessKey")]
     session_token: Annotated[str | None, Field(alias="sessionToken")] = None
@@ -6506,27 +6515,6 @@ class TurnInputAcceptedThreadRealtimeItem(BaseModel):
     ]
 
 
-class SessionEndInputSavedThreadRealtimeItem(BaseModel):
-    model_config = ConfigDict(
-        populate_by_name=True,
-    )
-    id: str
-    observed_at_ms: Annotated[
-        int | None,
-        Field(
-            alias="observedAtMs",
-            description="Canonical observation time in Unix milliseconds for eligible voice calls.",
-        ),
-    ] = None
-    realtime_session_id: Annotated[str, Field(alias="realtimeSessionId")]
-    input: str
-    input_item_id: str
-    source_event_ids: list[str]
-    type: Annotated[
-        Literal["sessionEndInputSaved"], Field(title="SessionEndInputSavedThreadRealtimeItemType")
-    ]
-
-
 class ThreadRealtimeItemAddedNotification(BaseModel):
     model_config = ConfigDict(
         populate_by_name=True,
@@ -6563,6 +6551,11 @@ class ThreadRealtimeSdpNotification(BaseModel):
     )
     sdp: str
     thread_id: Annotated[str, Field(alias="threadId")]
+
+
+class ThreadRealtimeSessionInputReason(Enum):
+    chunk = "chunk"
+    session_end = "sessionEnd"
 
 
 class ThreadRealtimeSessionOutcome(Enum):
@@ -7479,6 +7472,12 @@ class AccountUpdatedNotification(BaseModel):
     )
     auth_mode: Annotated[AuthMode | None, Field(alias="authMode")] = None
     plan_type: Annotated[PlanType | None, Field(alias="planType")] = None
+    reason: Annotated[
+        AccountUpdateReason | None,
+        Field(
+            description="Set when initial routing discovery completes for the same authenticated owner."
+        ),
+    ] = None
 
 
 class AdditionalContextEntry(BaseModel):
@@ -7585,6 +7584,15 @@ class AppTemplateSummary(BaseModel):
     name: str
     reason: AppTemplateUnavailableReason | None = None
     template_id: Annotated[str, Field(alias="templateId")]
+
+
+class AppToolConfig(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    approval_mode: AppToolApproval | None = None
+    approvals_reviewer: ApprovalsReviewer | None = None
+    enabled: bool | None = None
 
 
 class ApplicationNetworkRequirements(BaseModel):
@@ -9874,6 +9882,8 @@ class OtelRequirements(BaseModel):
     )
     environment: str | None = None
     exporter: OtelExporter | None = None
+    headers_helper: str | None = None
+    headers_helper_refresh_interval_ms: Annotated[int | None, Field(ge=1)] = None
     log_agent_responses: bool | None = None
     log_guardian_assessments: bool | None = None
     log_sse_deltas: bool | None = None
@@ -11383,6 +11393,28 @@ class RealtimeSessionClosedThreadRealtimeItem(BaseModel):
     ]
 
 
+class SessionInputSavedThreadRealtimeItem(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    id: str
+    observed_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="observedAtMs",
+            description="Canonical observation time in Unix milliseconds for eligible voice calls.",
+        ),
+    ] = None
+    realtime_session_id: Annotated[str, Field(alias="realtimeSessionId")]
+    input: str
+    input_item_id: str
+    reason: ThreadRealtimeSessionInputReason
+    source_event_ids: list[str]
+    type: Annotated[
+        Literal["sessionInputSaved"], Field(title="SessionInputSavedThreadRealtimeItemType")
+    ]
+
+
 class ThreadRealtimeItem(
     RootModel[
         RealtimeSessionStartedThreadRealtimeItem
@@ -11391,7 +11423,7 @@ class ThreadRealtimeItem(
         | BemItemPromotedThreadRealtimeItem
         | RealtimeSessionClosedThreadRealtimeItem
         | TurnInputAcceptedThreadRealtimeItem
-        | SessionEndInputSavedThreadRealtimeItem
+        | SessionInputSavedThreadRealtimeItem
     ]
 ):
     root: Annotated[
@@ -11401,7 +11433,7 @@ class ThreadRealtimeItem(
         | BemItemPromotedThreadRealtimeItem
         | RealtimeSessionClosedThreadRealtimeItem
         | TurnInputAcceptedThreadRealtimeItem
-        | SessionEndInputSavedThreadRealtimeItem,
+        | SessionInputSavedThreadRealtimeItem,
         Field(
             description="EXPERIMENTAL - a thread-scoped realtime item in the canonical timeline."
         ),
@@ -14411,6 +14443,31 @@ class ItemAutoApprovalReviewCompletedServerNotification(BaseModel):
     params: ItemGuardianApprovalReviewCompletedNotification
 
 
+class ThreadSearchPartialNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    data: list[ThreadSearchResult]
+    request_id: Annotated[RequestId, Field(alias="requestId")]
+
+
+class ThreadSearchPartialServerNotification(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+    )
+    emitted_at_ms: Annotated[
+        int | None,
+        Field(
+            alias="emittedAtMs",
+            description="Unix timestamp (in milliseconds) when app-server emitted this notification.",
+        ),
+    ] = None
+    method: Annotated[
+        Literal["thread/search/partial"], Field(title="Thread/search/partialNotificationMethod")
+    ]
+    params: ThreadSearchPartialNotification
+
+
 class ServerNotification(
     RootModel[
         ErrorServerNotification
@@ -14451,6 +14508,7 @@ class ServerNotification(
         | ItemPlanDeltaServerNotification
         | CommandExecOutputDeltaServerNotification
         | ProcessOutputDeltaServerNotification
+        | ThreadSearchPartialServerNotification
         | ProcessExitedServerNotification
         | ItemCommandExecutionOutputDeltaServerNotification
         | ItemCommandExecutionTerminalInteractionServerNotification
@@ -14540,6 +14598,7 @@ class ServerNotification(
         | ItemPlanDeltaServerNotification
         | CommandExecOutputDeltaServerNotification
         | ProcessOutputDeltaServerNotification
+        | ThreadSearchPartialServerNotification
         | ProcessExitedServerNotification
         | ItemCommandExecutionOutputDeltaServerNotification
         | ItemCommandExecutionTerminalInteractionServerNotification

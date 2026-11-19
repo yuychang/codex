@@ -4,7 +4,7 @@ mod descriptor;
 pub(crate) mod discovery;
 mod inventory;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 
 use crate::config_update::read_effective_config_with_layers;
 use codex_app_server_client::AppServerRequestHandle;
@@ -22,9 +22,10 @@ pub(crate) use descriptor::StatuslineProvider;
 use serde_json::Value;
 use std::collections::HashMap;
 use tokio::time::Duration;
+use tokio::time::Instant;
 use uuid::Uuid;
 
-const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProviderLookupError {
@@ -52,6 +53,12 @@ impl From<&str> for McpServerName {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct McpToolName(String);
 
+impl McpToolName {
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl From<&str> for McpToolName {
     fn from(name: &str) -> Self {
         Self(name.to_owned())
@@ -65,10 +72,27 @@ pub(crate) struct ProviderId {
     pub(crate) tool: McpToolName,
 }
 
+impl From<&codex_config::types::StatusLineProviderId> for ProviderId {
+    fn from(id: &codex_config::types::StatusLineProviderId) -> Self {
+        Self {
+            server: id.server.as_str().into(),
+            tool: id.tool.as_str().into(),
+        }
+    }
+}
+
+impl From<&ProviderId> for codex_config::types::StatusLineProviderId {
+    fn from(id: &ProviderId) -> Self {
+        Self {
+            server: id.server.0.clone(),
+            tool: id.tool.0.clone(),
+        }
+    }
+}
+
 pub(crate) enum ProviderSelection<'a> {
     Saved(&'a ProviderId),
     /// A provider advertised during the current picker refresh.
-    #[cfg_attr(not(test), expect(dead_code, reason = "staged picker selection"))]
     Discovered(&'a StatuslineProvider),
 }
 
@@ -84,11 +108,17 @@ impl ResolvedStatuslineProvider {
         thread: ThreadId,
         cwd: &PathUri,
         selection: ProviderSelection<'_>,
+        deadline: Instant,
     ) -> Result<Option<Self>, ProviderLookupError> {
         tokio::select! {
             biased;
-            () = tokio::time::sleep(LOOKUP_TIMEOUT) => Err(ProviderLookupError::TimedOut),
-            result = Self::resolve(client, thread, cwd, selection) => Ok(result?),
+            () = tokio::time::sleep_until(deadline) => Err(ProviderLookupError::TimedOut),
+            result = Self::resolve(client, thread, cwd, selection) => {
+                if Instant::now() >= deadline {
+                    return Err(ProviderLookupError::TimedOut);
+                }
+                Ok(result?)
+            }
         }
     }
 
@@ -165,10 +195,12 @@ impl ResolvedStatuslineProvider {
     /// A thread/start override can also replace a configured command before lookup. Both
     /// registrations report the same name and no plugin ID. Same-owner plugin replacements
     /// are indistinguishable for the same reason.
-    pub(crate) async fn read(&self, snapshot: Value) -> Result<McpResourceReadResponse> {
+    pub(crate) async fn read(
+        &self,
+        snapshot: Value,
+    ) -> Result<McpResourceReadResponse, codex_app_server_client::TypedRequestError> {
         let provider = &self.provider;
-        Ok(self
-            .client
+        self.client
             .request_typed(ClientRequest::McpResourceRead {
                 request_id: RequestId::String(Uuid::new_v4().to_string()),
                 params: McpResourceReadParams {
@@ -185,7 +217,7 @@ impl ResolvedStatuslineProvider {
                     )])),
                 },
             })
-            .await?)
+            .await
     }
 }
 
