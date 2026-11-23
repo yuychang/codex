@@ -12,13 +12,11 @@ use super::X_CODEX_PARENT_THREAD_ID_HEADER;
 use super::X_CODEX_TURN_METADATA_HEADER;
 use super::X_CODEX_WINDOW_ID_HEADER;
 use super::X_OPENAI_SUBAGENT_HEADER;
-use super::sampling_result_owner;
+use super::sampling_result_destination;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
 use crate::responses_metadata::CodexResponsesMetadata;
-use crate::responses_metadata::MAX_MCP_ATTRIBUTION_BYTES;
-use crate::responses_metadata::MCP_ATTRIBUTION_CLIENT_METADATA_KEY;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
 use base64::Engine;
@@ -51,9 +49,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::CodexErrorDetails;
-use codex_protocol::mcp::McpAttribution;
-use codex_protocol::mcp::McpAttributionSource;
-use codex_protocol::mcp::McpAttributionStatus;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ExecutedToolCall;
@@ -70,7 +65,6 @@ use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
-use codex_protocol_test_support::uuid_v7_item_id_generator_for_test;
 use codex_rollout_trace::ExecutionStatus;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
@@ -83,6 +77,8 @@ use codex_runtime_agent_instance::AgentHostAuthorization;
 use codex_runtime_agent_instance::RuntimeAuthManager;
 use codex_runtime_agent_instance::RuntimeRegistrationMetadata;
 use codex_runtime_agent_instance::RuntimeRole;
+use codex_thread_context_ids::ThreadContextIds;
+use codex_thread_context_ids_test_support::thread_context_ids;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
@@ -119,19 +115,20 @@ use wiremock::matchers::path;
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
 fn test_model_client(session_source: SessionSource) -> ModelClient {
-    test_model_client_with_thread_id(ThreadId::new(), session_source)
+    test_model_client_with_ids(ThreadId::new(), session_source, thread_context_ids())
 }
 
-fn test_model_client_with_thread_id(
+fn test_model_client_with_ids(
     thread_id: ThreadId,
     session_source: SessionSource,
+    context_ids: ThreadContextIds,
 ) -> ModelClient {
     let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
     ModelClient::new(
         codex_model_provider::create_model_provider(provider, /*auth_manager*/ None),
         AgentIdentityAuthPolicy::JwtOnly,
         thread_id,
-        uuid_v7_item_id_generator_for_test(),
+        context_ids,
         session_source,
         "test_originator".to_string(),
         /*model_verbosity*/ None,
@@ -431,7 +428,6 @@ async fn client_setup_rebuilds_chatgpt_refresh_but_rejects_account_switches() {
             AuthManager::from_auth_for_testing_with_home(initial, home.path().to_path_buf());
         let refreshed_token = token(user, "refreshed");
         let mut info = test_model_provider().info().clone();
-        info.base_url = Some(CHATGPT_CODEX_BASE_URL.to_string());
         info.requires_openai_auth = true;
         let provider = Arc::new(SetupRefreshProvider {
             inner: create_model_provider(info, Some(manager.clone())),
@@ -456,13 +452,20 @@ async fn client_setup_rebuilds_chatgpt_refresh_but_rejects_account_switches() {
                 &format!("Bearer {refreshed_token}")
             );
             let empty = http::HeaderMap::new();
+            // A configured provider using the same ChatGPT credentials cannot receive results.
+            assert_eq!(
+                sampling_result_destination(&setup, /*include_internal*/ true, &empty),
+                None
+            );
+            setup.api_provider.base_url = codex_model_provider_info::CHATGPT_CODEX_BASE_URL.into();
             for (internal, response_headers, owner) in [
                 (true, &empty, setup.auth_owner.clone()),
                 (false, &empty, None),
                 (true, &headers, None),
             ] {
                 assert_eq!(
-                    sampling_result_owner(&setup, internal, response_headers),
+                    sampling_result_destination(&setup, internal, response_headers)
+                        .map(|destination| destination.owner),
                     owner
                 );
             }
@@ -471,7 +474,7 @@ async fn client_setup_rebuilds_chatgpt_refresh_but_rejects_account_switches() {
                 http::HeaderValue::from_static("another-organization"),
             );
             assert_eq!(
-                sampling_result_owner(&setup, /*include_internal*/ true, &empty),
+                sampling_result_destination(&setup, /*include_internal*/ true, &empty),
                 None,
             );
             assert_eq!(setup.auth.unwrap().get_token().unwrap(), refreshed_token);
@@ -576,7 +579,7 @@ async fn responses_request_includes_internal_metadata_for_provider_grant_or_firs
     for id in ["first", "second"] {
         let call = ToolCall {
             tool_name: codex_tools::ToolName::plain("mcp__apps__read"),
-            call_id: id.to_string(),
+            call_id: id.into(),
             payload: ToolPayload::Function {
                 arguments: json!({"query": id}).to_string(),
             },
@@ -594,7 +597,7 @@ async fn responses_request_includes_internal_metadata_for_provider_grant_or_firs
         recorder.attach_direct_call_to_output(
             &mut item,
             Some((recorded, permit)),
-            &session.item_id_generator,
+            &session.context_ids,
         );
         outputs.push(item);
     }
@@ -639,29 +642,17 @@ async fn responses_request_includes_internal_metadata_for_provider_grant_or_firs
         "private": { "resource": "raw-result-metadata" },
     })));
     let without_raw_metadata = output_with_tool_result_metadata(ToolResultMetadata::default());
-    let attribution = McpAttribution {
-        status: McpAttributionStatus::Complete,
-        error_reason: None,
-        sources: vec![McpAttributionSource {
-            connector_id: Some("connector_example".to_string()),
-            plugin_id: Some("example@openai-bundled".to_string()),
-            server_name: "codex_apps".to_string(),
-            tool_name: "search".to_string(),
-            first_turn_id: "turn_123".to_string(),
-        }],
-    };
     let prompt = Prompt {
         input: vec![output.clone(), omitted_output.clone()],
         ..Default::default()
     };
-    let mut responses_metadata = test_responses_metadata_for_client(
+    let responses_metadata = test_responses_metadata_for_client(
         &client,
         /*turn_id*/ None,
         format!("{}:0", client.state.thread_id),
         /*parent_thread_id*/ None,
         TestCodexResponsesRequestKind::Turn,
     );
-    responses_metadata.mcp_attribution = Some(attribution.clone());
     for (provider_grant, base_url, allowed) in [
         (false, "https://api.openai.com/v1", true),
         (false, "https://chatgpt.com/backend-api/codex", true),
@@ -712,15 +703,6 @@ async fn responses_request_includes_internal_metadata_for_provider_grant_or_firs
                 serde_json::to_value(&request)?["input"],
                 expected_wire_input
             );
-            let expected_json = allowed
-                .then(|| serde_json::to_string(&attribution).map(serde_json::Value::String))
-                .transpose()?;
-            assert_eq!(
-                serde_json::to_value(&request)?
-                    .get("client_metadata")
-                    .and_then(|metadata| metadata.get(MCP_ATTRIBUTION_CLIENT_METADATA_KEY)),
-                expected_json.as_ref(),
-            );
             let ws_client_metadata = client.build_ws_client_metadata(
                 &responses_metadata,
                 include_internal,
@@ -732,70 +714,9 @@ async fn responses_request_includes_internal_metadata_for_provider_grant_or_firs
             };
             let ws_request = serde_json::to_value(ws_request)?;
             assert_eq!(ws_request["input"], expected_wire_input);
-            assert_eq!(
-                ws_request
-                    .get("client_metadata")
-                    .and_then(|metadata| metadata.get(MCP_ATTRIBUTION_CLIENT_METADATA_KEY)),
-                expected_json.as_ref(),
-            );
-            assert!(
-                serde_json::to_value(&request)?
-                    .get("mcp_attribution")
-                    .is_none()
-            );
             assert_eq!(prompt.input, vec![output.clone(), omitted_output.clone()]);
         }
     }
-    responses_metadata.mcp_attribution = Some(McpAttribution {
-        status: McpAttributionStatus::AttributionError,
-        error_reason: Some(
-            codex_protocol::mcp::McpAttributionErrorReason::HistoryMissingCheckpoint,
-        ),
-        sources: attribution.sources.clone(),
-    });
-    let request = client.build_responses_request(
-        &prompt,
-        &test_model_info(),
-        /*effort*/ None,
-        codex_protocol::config_types::ReasoningSummary::None,
-        /*service_tier*/ None,
-        &responses_metadata,
-        /*include_internal*/ true,
-    )?;
-    assert_eq!(
-        request
-            .client_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get(MCP_ATTRIBUTION_CLIENT_METADATA_KEY))
-            .map(|value| serde_json::from_str::<serde_json::Value>(value))
-            .transpose()?,
-        Some(json!({
-            "status": "attribution_error",
-            "sources": attribution.sources,
-            "error_reason": "history_missing_checkpoint",
-        })),
-    );
-
-    let mut oversized_attribution = attribution;
-    oversized_attribution.sources[0].tool_name = "a".repeat(MAX_MCP_ATTRIBUTION_BYTES);
-    responses_metadata.mcp_attribution = Some(oversized_attribution);
-    let request = client.build_responses_request(
-        &prompt,
-        &test_model_info(),
-        /*effort*/ None,
-        codex_protocol::config_types::ReasoningSummary::None,
-        /*service_tier*/ None,
-        &responses_metadata,
-        /*include_internal*/ true,
-    )?;
-    assert_eq!(
-        request.client_metadata.as_ref().and_then(|metadata| {
-            metadata
-                .get(MCP_ATTRIBUTION_CLIENT_METADATA_KEY)
-                .map(String::as_str)
-        }),
-        Some(r#"{"status":"attribution_error","error_reason":"payload_too_large"}"#),
-    );
     Ok(())
 }
 
@@ -1162,7 +1083,7 @@ async fn responses_http_preserves_raw_tool_metadata_for_openai_custom_endpoint()
 #[test_case::test_case(true; "responses_lite")]
 fn prefix_ids_track_thread_and_payload(responses_lite: bool) -> anyhow::Result<()> {
     let thread_id = ThreadId::new();
-    let client = test_model_client_with_thread_id(thread_id, SessionSource::Cli);
+    let client = test_model_client_with_ids(thread_id, SessionSource::Cli, thread_context_ids());
     let mut model = test_model_info();
     model.use_responses_lite = responses_lite;
     let instructions_index = usize::from(responses_lite);
@@ -1228,10 +1149,7 @@ fn prefix_ids_track_thread_and_payload(responses_lite: bool) -> anyhow::Result<(
         );
     }
 
-    let independent = build(
-        &test_model_client_with_thread_id(ThreadId::new(), SessionSource::Cli),
-        &prompt,
-    )?;
+    let independent = build(&test_model_client(SessionSource::Cli), &prompt)?;
     assert_ne!(
         independent.input[instructions_index].id(),
         changed_tools.input[instructions_index].id()
@@ -2269,7 +2187,7 @@ fn model_client_with_counting_attestation(
         codex_model_provider::create_model_provider(provider, auth_manager),
         AgentIdentityAuthPolicy::JwtOnly,
         ThreadId::new(),
-        uuid_v7_item_id_generator_for_test(),
+        thread_context_ids(),
         SessionSource::Exec,
         "test_originator".to_string(),
         /*model_verbosity*/ None,

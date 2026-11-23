@@ -26,6 +26,7 @@
 //! Preset submenu hints borrow slots and reflow with the composer.
 //!
 //! Shell mode starts when input inserts a leading `!`, never when deletion exposes one.
+//! Completion menus stay closed in shell mode so shell syntax remains literal.
 //! Literal leading bangs remain ordinary messages on submission and during same-draft restoration.
 //! Vim Replace preserves the overwritten leading grapheme until Backspace removes an absorbed `!`.
 //! The plain-text preset keeps command prefixes literal, including `!`, so Enter and Tab
@@ -122,14 +123,8 @@
 //! keeps prompt-history search; explicitly configured keybindings retain precedence.
 //! Vim queries stay draft-local.
 //!
-//! Slash commands are staged for local history instead of being recorded immediately.
-//! Finite first arguments have a separate completion menu: Tab inserts the selected argument,
-//! while Enter submits the literal draft. Mentions retain priority over argument suggestions.
-//! Argument suggestions retain the latest restricted routing mode across redraws and evaluate
-//! completed arguments against parent-owned policy during ordinary input. Unavailable-thread
-//! recovery keeps its existing exemption from that policy.
-//! Command recall is a two-phase handoff: stage the submitted slash text here, then record it after
-//! `ChatWidget` dispatches the command.
+//! Slash history is staged here and recorded after `ChatWidget` dispatches the command.
+//! [`slash_argument`] handles positional and named completions, popup keys, and restricted routing.
 //!
 //! # Question Draft Recovery
 //!
@@ -174,6 +169,7 @@
 //! - Treats a leading `!` revealed only by paste expansion as literal model input, not shell input.
 //! - Prunes local attached images so only placeholders that survive expansion are sent.
 //! - Preserves remote image URLs as separate attachments even when text is empty.
+//! - Copies pasted image files into private temporary attachments before retaining their paths.
 //!
 //! When these paths clear the visible textarea after a successful submit or slash-command
 //! dispatch, they intentionally preserve the textarea kill buffer. That lets users `Ctrl+K` part
@@ -198,10 +194,11 @@
 //! navigation slash commands remain available so users can leave or manage the view.
 //! Exports and local display commands (`/title` and `/statusline`) also accept arguments.
 //!
-//! During reconnection, `handle_restricted_key` edits the draft directly without popup dispatch,
-//! composer shortcuts, or submission; `?` becomes literal input. Enter and Tab leave the draft
-//! intact until reconnection succeeds, except for `/warnings`, `/config`, `/rc` (alias `/remote`,
-//! including `stop`), `/quit`, and `/exit`.
+//! While disconnected, `handle_restricted_key` keeps the draft editable without submission.
+//! The slash popup supports navigation, Tab and submission of local commands.
+//! Local commands include `/warnings`, `/config`, `/rc` (alias `/remote`, including `stop`),
+//! `/feedback` (thread ID and reconnection guidance), `/quit`, and `/exit`. Searching for
+//! other commands shows that they require a server connection. `?` becomes literal input.
 //! When connected but the thread is unavailable, configured
 //! submit keys may dispatch explicitly allowed recovery and local commands; other drafts stay put.
 //! Escape dismisses command and argument popups while preserving the Vim Insert-to-Normal transition.
@@ -395,6 +392,7 @@ use super::mentions_v2::MentionV2Selection;
 use super::paste_burst::CharDecision;
 use super::paste_burst::PasteBurst;
 use super::prompt_args::parse_slash_name;
+use super::prompt_args::slash_args_elements;
 use super::skill_popup::MentionItem;
 use super::skill_popup::SkillPopup;
 use super::slash_commands::ServiceTierCommand;
@@ -466,8 +464,6 @@ use crate::app_event_sender::AppEventSender;
 use crate::bottom_pane::LocalImageAttachment;
 use crate::bottom_pane::MentionBinding;
 use crate::bottom_pane::textarea::TextArea;
-use crate::clipboard_paste::normalize_pasted_path;
-use crate::clipboard_paste::pasted_image_format;
 use crate::history_cell;
 use crate::skills_helpers::skill_display_name;
 use crate::tui::FrameRequester;
@@ -1337,32 +1333,6 @@ impl ChatComposer {
 
     pub(crate) fn record_replayed_user_message_history(&mut self, entry: HistoryEntry) {
         self.history.record_replayed_submission(entry);
-    }
-
-    pub fn handle_paste_image_path(&mut self, pasted: &str) -> bool {
-        let Some(path_buf) = normalize_pasted_path(pasted) else {
-            return false;
-        };
-
-        // Opening a serial device or FIFO can block the input loop.
-        if !path_buf.is_file() {
-            return false;
-        }
-
-        match image::image_dimensions(&path_buf) {
-            Ok((width, height)) => {
-                tracing::info!("OK: {pasted}");
-                tracing::debug!("image dimensions={}x{}", width, height);
-                let format = pasted_image_format(&path_buf);
-                tracing::debug!("attached image format={}", format.label());
-                self.attach_image(path_buf);
-                true
-            }
-            Err(err) => {
-                tracing::trace!("ERR: {err}");
-                false
-            }
-        }
     }
 
     /// Replace the composer content with text from an external editor.
@@ -3534,7 +3504,7 @@ impl ChatComposer {
 
         self.stage_slash_command_history(&command);
 
-        let mut args_elements = slash_input::args_elements(
+        let mut args_elements = slash_args_elements(
             inline_command.rest,
             inline_command.rest_offset,
             &self.draft.textarea.text_elements(),
@@ -3568,7 +3538,7 @@ impl ChatComposer {
         let (prepared_text, prepared_elements) = self.prepare_submission_text(record_history)?;
         let (prepared_rest, prepared_rest_offset) = slash_input::prepared_args(&prepared_text)?;
         let mut args_elements =
-            slash_input::args_elements(prepared_rest, prepared_rest_offset, &prepared_elements);
+            slash_args_elements(prepared_rest, prepared_rest_offset, &prepared_elements);
         let trimmed_rest = prepared_rest.trim();
         args_elements = Self::trim_text_elements(prepared_rest, trimmed_rest, args_elements);
         self.draft.textarea.enter_vim_insert_mode();
@@ -4103,18 +4073,12 @@ impl ChatComposer {
             self.popups.active = ActivePopup::None;
             return;
         }
-        let mut mentions_v2_token = self.current_mentions_v2_token_range();
-        let mut file_token = if self.mentions_v2_enabled {
-            None
-        } else {
-            self.current_editable_at_token_range_with_options(/*allow_empty*/ false)
-        };
-        let browsing_history = self
-            .history
-            .should_handle_navigation(&self.current_text(), self.history_navigation_cursor());
-        // When browsing input history (shell-style Up/Down recall), skip all popup
-        // synchronization so nothing steals focus from continued history navigation.
-        if browsing_history {
+        // Suspend completion during shell input and history navigation, preserving dismissals.
+        if self.draft.is_bash_mode
+            || self
+                .history
+                .should_handle_navigation(&self.current_text(), self.history_navigation_cursor())
+        {
             if self.popups.current_file_query.is_some() {
                 self.app_event_tx
                     .send(AppEvent::StartFileSearch(String::new()));
@@ -4123,6 +4087,12 @@ impl ChatComposer {
             self.popups.active = ActivePopup::None;
             return;
         }
+        let mut mentions_v2_token = self.current_mentions_v2_token_range();
+        let mut file_token = if self.mentions_v2_enabled {
+            None
+        } else {
+            self.current_editable_at_token_range_with_options(/*allow_empty*/ false)
+        };
         let mut mention_target = self.current_mention_target();
         let at_token_start = mentions_v2_token
             .as_ref()
@@ -4141,7 +4111,6 @@ impl ChatComposer {
         }
 
         let allow_command_popup = self.slash_commands_enabled()
-            && !self.draft.is_bash_mode
             && file_token.is_none()
             && mentions_v2_token.is_none()
             && mention_target.is_none();
@@ -4224,13 +4193,17 @@ impl ChatComposer {
         let cursor = self.draft.textarea.cursor();
         let caret_on_first_line = cursor <= first_line_end;
 
-        let is_editing_slash_command_name = caret_on_first_line
-            && self
-                .slash_input()
-                .is_editing_command_name(first_line, cursor);
         let command_filter_text = caret_on_first_line
             .then(|| slash_input::command_popup_filter_text(first_line, cursor))
             .flatten();
+        let disconnected =
+            self.popups.restricted_input_mode == Some(RestrictedInputMode::Disconnected);
+        // Completing `/q` offline must not erase the rest of a draft like `/question`.
+        let is_editing_slash_command_name = caret_on_first_line
+            && (!disconnected || command_filter_text.as_deref() == Some(text.trim_end()))
+            && self
+                .slash_input()
+                .is_editing_command_name(first_line, cursor);
 
         // If the cursor is currently positioned within an `@token`, prefer the
         // file-search popup over the slash popup so users can insert a file path
@@ -4255,7 +4228,9 @@ impl ChatComposer {
                 if is_editing_slash_command_name
                     && let Some(command_filter_text) = command_filter_text.as_deref()
                 {
-                    let command_popup = self.slash_input().command_popup(command_filter_text);
+                    let command_popup = self
+                        .slash_input()
+                        .command_popup(command_filter_text, disconnected);
                     self.popups.active = ActivePopup::Command(command_popup);
                 }
             }
@@ -5490,7 +5465,13 @@ mod tests {
                 composer.set_status_line(Some(
                     Line::from("gpt-5.4 high fast · ~/code/codex-1 · Context 0% used").into(),
                 ));
-                composer.set_text_content("!git status".to_string(), Vec::new(), Vec::new());
+                composer.set_skill_mentions(Some(vec![test_skill_metadata("available")]));
+                composer.set_text_content(
+                    "!echo $env:HTTP_PROXY".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                composer.move_cursor_to_end();
             },
         );
 
@@ -7933,14 +7914,18 @@ mod tests {
                                 title: "Review database migration".to_string(),
                                 label_style: crate::thread_label::ThreadLabelStyle::Cloud,
                                 cwd: "/workspace/project".to_string(),
-                                snippet: "database migration".to_string(),
                             },
                             crate::task_mentions::TaskMention {
                                 thread_id: "task-456".to_string(),
                                 title: "migration".to_string(),
                                 label_style: crate::thread_label::ThreadLabelStyle::Plain,
                                 cwd: "/another/project".to_string(),
-                                snippet: "migration".to_string(),
+                            },
+                            crate::task_mentions::TaskMention {
+                                thread_id: "task-789".to_string(),
+                                title: "Unrelated task".to_string(),
+                                label_style: crate::thread_label::ThreadLabelStyle::Plain,
+                                cwd: "/workspace/migration".to_string(),
                             },
                         ],
                     );
@@ -7973,7 +7958,6 @@ mod tests {
             title: format!("task\n\t{}é{}", "a".repeat(154), "é".repeat(200)),
             label_style: crate::thread_label::ThreadLabelStyle::Plain,
             cwd: "/workspace/project".to_string(),
-            snippet: String::new(),
         };
         composer.on_task_search_result("task", vec![task.clone()]);
         composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -10345,30 +10329,28 @@ mod tests {
     }
 
     #[test]
-    fn bang_prefixed_slash_text_submits_literal_shell_command() {
-        use crossterm::event::KeyCode;
-        use crossterm::event::KeyEvent;
-        use crossterm::event::KeyModifiers;
+    fn bang_commands_submit_literal_completion_tokens() {
+        let (mut composer, _rx) = new_test_composer();
+        composer.set_skill_mentions(Some(vec![test_skill_metadata("available")]));
 
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-
-        type_chars_humanlike(&mut composer, &['!', '/', 'd', 'i', 'f', 'f']);
-
-        let (result, _needs_redraw) =
-            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-
-        assert!(matches!(
-            result,
-            InputResult::Submitted { ref text, .. } if text == "!/diff"
-        ));
+        for command in [
+            "!/diff",
+            "!echo $env:HTTP_PROXY",
+            "!echo $avail",
+            "!echo @file",
+        ] {
+            type_chars_humanlike(&mut composer, &command.chars().collect::<Vec<_>>());
+            assert!(!composer.popup_active(), "{command}");
+            let (result, _) =
+                composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(
+                result,
+                InputResult::Submitted {
+                    text: command.to_string(),
+                    text_elements: Vec::new(),
+                }
+            );
+        }
     }
 
     #[test]
@@ -10684,7 +10666,7 @@ mod tests {
     }
 
     #[test]
-    fn dismissed_file_popup_tracks_token_across_leading_whitespace_edits() {
+    fn dismissed_file_popup_tracks_token_across_prefix_edits() {
         let (mut composer, _rx) = new_test_composer();
         composer.set_text_content("@ma".to_string(), Vec::new(), Vec::new());
         composer.draft.textarea.set_cursor("@ma".len());
@@ -10696,6 +10678,10 @@ mod tests {
         assert!(matches!(composer.popups.active, ActivePopup::None));
 
         composer.draft.textarea.set_cursor(/*pos*/ 0);
+        type_chars_humanlike(&mut composer, &['!']);
+        let _ = composer.handle_key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(!composer.popup_active());
+
         composer.insert_str("   ");
         assert!(matches!(composer.popups.active, ActivePopup::None));
 
@@ -11885,32 +11871,6 @@ mod tests {
             "[Image #1]"
         );
         assert_eq!(composer.draft.textarea.text(), "[Image #1]");
-    }
-
-    #[test]
-    fn pasting_filepath_attaches_image() {
-        let tmp = tempdir().expect("create TempDir");
-        let tmp_path: PathBuf = tmp.path().join("codex_tui_test_paste_image.png");
-        let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-            ImageBuffer::from_fn(3, 2, |_x, _y| Rgba([1, 2, 3, 255]));
-        img.save(&tmp_path).expect("failed to write temp png");
-
-        let (tx, _rx) = unbounded_channel::<AppEvent>();
-        let sender = AppEventSender::new(tx);
-        let mut composer = ChatComposer::new(
-            /*has_input_focus*/ true,
-            sender,
-            /*enhanced_keys_supported*/ false,
-            "Ask Codex to do anything".to_string(),
-            /*disable_paste_burst*/ false,
-        );
-
-        let needs_redraw = composer.handle_paste(tmp_path.to_string_lossy().to_string());
-        assert!(needs_redraw);
-        assert!(composer.draft.textarea.text().starts_with("[Image #1] "));
-
-        let imgs = composer.take_recent_submission_images();
-        assert_eq!(imgs, vec![tmp_path]);
     }
 
     #[test]

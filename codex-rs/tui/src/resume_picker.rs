@@ -4178,6 +4178,14 @@ fn format_timestamp(ts: DateTime<Utc>, clock_format: ClockFormat) -> String {
     .to_string()
 }
 
+pub(crate) fn loading_sessions_line() -> Line<'static> {
+    Line::from(
+        "Loading sessions…"
+            .set_style(secondary_text_style())
+            .italic(),
+    )
+}
+
 fn render_empty_state_line(state: &PickerState) -> Line<'static> {
     if !state.query.is_empty() {
         if state.search_state.is_active()
@@ -4202,12 +4210,7 @@ fn render_empty_state_line(state: &PickerState) -> Line<'static> {
 
     if state.pagination.is_loading() {
         if state.all_rows.is_empty() && state.pagination.num_scanned_files == 0 {
-            return vec![
-                "Loading sessions…"
-                    .set_style(secondary_text_style())
-                    .italic(),
-            ]
-            .into();
+            return loading_sessions_line();
         }
         return vec![
             "Loading older sessions…"
@@ -4893,7 +4896,7 @@ mod tests {
         state.cloud_backends.insert(state.backend_id);
         insta::assert_snapshot!(
             render_expanded_session_details(&row, &state, /*width*/ 53)[0].to_string(),
-            @"  │ Session:    ☁︎ feat(tui): add raw scrollback mode…"
+            @"  │ Session:    ☁️ feat(tui): add raw scrollback mod…"
         );
         assert!(rendered.contains("Branch:      codex/raw-scrollback-mode"));
         assert!(rendered.contains("Conversation:"));
@@ -5243,7 +5246,7 @@ mod tests {
             )[0]
                 .to_string()
                 .trim_end(),
-            @"  42s ago     ☁︎ Fix resume p…"
+            @"  42s ago     ☁️ Fix resume …"
         );
     }
 
@@ -7735,6 +7738,7 @@ session_picker_view = "dense"
             section_entered_at: None,
             project_id: None,
             daybreak_enabled: None,
+            daybreak_program_propagation_enrolled: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             model: None,
@@ -7783,6 +7787,7 @@ session_picker_view = "dense"
             section_entered_at: None,
             project_id: None,
             daybreak_enabled: None,
+            daybreak_program_propagation_enrolled: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             model: None,
@@ -7886,6 +7891,7 @@ session_picker_view = "dense"
             section_entered_at: None,
             project_id: None,
             daybreak_enabled: None,
+            daybreak_program_propagation_enrolled: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             model: None,
@@ -7966,6 +7972,7 @@ session_picker_view = "dense"
             section_entered_at: None,
             project_id: None,
             daybreak_enabled: None,
+            daybreak_program_propagation_enrolled: None,
             history_mode: Default::default(),
             model_provider: String::from("openai"),
             model: None,

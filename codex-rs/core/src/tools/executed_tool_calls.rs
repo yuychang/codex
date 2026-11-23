@@ -4,7 +4,6 @@
 #[cfg(test)]
 #[path = "executed_tool_calls_direct_tests.rs"]
 mod direct_tests;
-mod mcp_attribution;
 mod request_metadata;
 
 use std::collections::HashMap;
@@ -26,8 +25,6 @@ use codex_model_provider::provider_uses_first_party_auth_path;
 use codex_protocol::ResponseItemId;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::mcp::CallToolResult;
-use codex_protocol::mcp::McpAttribution;
-use codex_protocol::mcp::McpAttributionSource;
 use codex_protocol::models::ExecutedToolCall;
 use codex_protocol::models::ExecutedToolCallArguments;
 use codex_protocol::models::ResponseItem;
@@ -36,6 +33,7 @@ use codex_protocol::models::ToolResultMetadata;
 use codex_protocol::models::executed_tool_call_metadata_bytes;
 use codex_protocol::models::normalize_executed_tool_call_completeness;
 use codex_protocol::openai_models::ToolMode;
+use codex_tool_call_id::ToolCallId;
 use indexmap::IndexMap;
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
@@ -72,7 +70,6 @@ pub(crate) struct ExecutedToolCalls {
     captures_result_bodies: bool,
     retained_direct_metadata_bytes: Arc<AtomicUsize>,
     pending_direct_calls: Arc<AtomicUsize>,
-    mcp_attribution: mcp_attribution::McpAttributionRecorder,
 }
 
 /// Private bytes belong to one regular task. History keeps only the host-issued IDs.
@@ -90,6 +87,48 @@ struct RetainedResultBodies {
     bytes: usize,
 }
 
+/// Permission at dispatch for this call. Holding it must not extend the originating turn.
+pub(super) struct ResultBodyCapture<'a> {
+    turn: Weak<ResultBodyTurn>,
+    nested_call_id: Option<&'a str>,
+}
+
+impl ResultBodyCapture<'_> {
+    fn is_current(&self, turn: &ResultBodyTurn, _retained: &RetainedResultBodies) -> bool {
+        turn.owner.is_current()
+    }
+
+    pub(super) fn record(
+        self,
+        result: &CallToolResult,
+        permits_source: impl FnOnce(AuthMode) -> bool,
+    ) -> Option<Arc<PendingResultBody>> {
+        let turn = self.turn.upgrade()?;
+        if !permits_source(turn.auth_mode) || !self.is_current(&turn, &turn.lock_bodies()) {
+            return None;
+        }
+        let mut body = ToolResultBody::from_mcp_result(result)?;
+        if let Some(call_id) = self.nested_call_id {
+            body.set_nested_call_id(call_id);
+        }
+        let mut retained = turn.lock_bodies();
+        if !self.is_current(&turn, &retained)
+            || retained.by_id.len() >= MAX_PENDING_EXECUTED_TOOL_CALLS
+            || body.compact_bytes() > MAX_TURN_RESULT_BODY_BYTES - retained.bytes
+        {
+            return None;
+        }
+        let id = Uuid::new_v4();
+        retained.bytes += body.compact_bytes();
+        retained.by_id.insert(id, Arc::new(body));
+        Some(Arc::new(PendingResultBody {
+            turn: self.turn,
+            id,
+            accepted: AtomicBool::new(false),
+        }))
+    }
+}
+
 /// Refund the provisional slot when a callback blocks or the call is cancelled.
 #[derive(Debug)]
 pub(crate) struct PendingResultBody {
@@ -99,14 +138,6 @@ pub(crate) struct PendingResultBody {
 }
 
 impl PendingResultBody {
-    fn record(turn: &Arc<ResultBodyTurn>, result: &CallToolResult) -> Option<Arc<Self>> {
-        Some(Arc::new(Self {
-            id: turn.record(result)?,
-            turn: Arc::downgrade(turn),
-            accepted: AtomicBool::new(false),
-        }))
-    }
-
     pub(super) fn accept(&self) -> Option<Uuid> {
         self.turn.upgrade().filter(|turn| turn.is_current())?;
         self.accepted.store(true, Ordering::Relaxed);
@@ -149,21 +180,17 @@ impl ResultBodyTurn {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(super) fn record(&self, result: &CallToolResult) -> Option<Uuid> {
-        if !self.is_current() {
+    fn start_capture<'a>(
+        self: &Arc<Self>,
+        nested_call_id: Option<&'a str>,
+    ) -> Option<ResultBodyCapture<'a>> {
+        if !self.owner.is_current() {
             return None;
         }
-        let body = ToolResultBody::from_mcp_result(result)?;
-        let mut retained = self.lock_bodies();
-        if retained.by_id.len() >= MAX_PENDING_EXECUTED_TOOL_CALLS
-            || body.compact_bytes() > MAX_TURN_RESULT_BODY_BYTES - retained.bytes
-        {
-            return None;
-        }
-        let id = Uuid::new_v4();
-        retained.bytes += body.compact_bytes();
-        retained.by_id.insert(id, Arc::new(body));
-        Some(id)
+        Some(ResultBodyCapture {
+            turn: Arc::downgrade(self),
+            nested_call_id,
+        })
     }
 
     /// Select the existing call records on this authorized sampling request.
@@ -240,28 +267,39 @@ struct ExecutedToolCallRecorderState {
     // Keep nested IDs separate so this conservative filter cannot change existing completeness.
     seen_nested_ids: SeenIds,
     can_prove_wait_completion: bool,
-    pending_wrapper_origins: HashSet<String>,
+    pending_wrapper_origins: HashSet<ToolCallId>,
 }
 
 /// Keep each output's calls and completion marker together through replay and pruning.
 #[derive(Default)]
 struct RetainedToolCalls {
+    output_item_id: Option<ResponseItemId>,
     calls: Vec<ExecutedToolCall>,
     complete: bool,
     cell_id: Option<String>,
     runtime_cell_id: Option<CellId>,
     // Invocation IDs stay local and are retained only with their original output's calls.
-    call_index_by_id: HashMap<String, usize>,
+    call_index_by_id: HashMap<ToolCallId, usize>,
     // Track newly backfilled metadata separately from pre-existing observations.
-    truncated_call_index_by_id: HashMap<String, usize>,
+    truncated_call_index_by_id: HashMap<ToolCallId, usize>,
     late_truncated_indices: HashSet<usize>,
     result_metadata_updated: bool,
 }
 
 impl RetainedToolCalls {
-    fn clear_late_truncated_metadata(&mut self) {
+    fn invalidate_output(&mut self, turn: &Weak<ResultBodyTurn>) {
+        if self.output_item_id.take().is_some() {
+            for call in &mut self.calls {
+                ResultBodyTurn::discard_call(turn, call);
+            }
+        }
+        self.clear_late_truncated_metadata(turn);
+    }
+
+    fn clear_late_truncated_metadata(&mut self, turn: &Weak<ResultBodyTurn>) {
         for index in self.late_truncated_indices.drain() {
             if let Some(call) = self.calls.get_mut(index) {
+                ResultBodyTurn::discard(turn, call.tool_result_id());
                 call.set_tool_result_metadata(ToolResultMetadata::default());
                 self.result_metadata_updated = true;
             }
@@ -281,12 +319,24 @@ enum CellCompletion {
 
 #[derive(Default)]
 struct RecordedCell {
-    pending_calls: IndexMap<String, ExecutedToolCall>,
+    output_item_id: Option<ResponseItemId>,
+    pending_calls: IndexMap<ToolCallId, ExecutedToolCall>,
     completion: CellCompletion,
     originating_call_id: Option<String>,
     truncated_metadata_binding_valid: bool,
     observed_truncated_call: bool,
     dispatch_closed: bool,
+}
+
+impl RecordedCell {
+    fn invalidate_binding(&mut self, turn: &Weak<ResultBodyTurn>) {
+        // Unbound rows lose their IDs at attachment. Only a live turn has bytes to release here.
+        if std::mem::take(&mut self.truncated_metadata_binding_valid) && turn.strong_count() != 0 {
+            for call in self.pending_calls.values_mut() {
+                ResultBodyTurn::discard_call(turn, call);
+            }
+        }
+    }
 }
 
 impl ExecutedToolCallRecorderState {
@@ -295,13 +345,13 @@ impl ExecutedToolCallRecorderState {
         for cell in self.cells.values_mut() {
             if cell.originating_call_id.as_deref() == Some(origin) {
                 cell.completion = CellCompletion::Incomplete;
-                cell.truncated_metadata_binding_valid = false;
+                cell.invalidate_binding(&self.body_turn);
             }
         }
         for ((_, output_id), retained) in &mut self.retained_calls {
             if output_id == origin || retained.cell_id.as_deref() == Some(origin) {
                 retained.complete = false;
-                retained.clear_late_truncated_metadata();
+                retained.invalidate_output(&self.body_turn);
             }
         }
     }
@@ -319,12 +369,12 @@ impl ExecutedToolCallRecorderState {
     fn invalidate_cell(&mut self, cell_id: &CellId) {
         if let Some(cell) = self.cells.get_mut(cell_id) {
             cell.completion = CellCompletion::Incomplete;
-            cell.truncated_metadata_binding_valid = false;
+            cell.invalidate_binding(&self.body_turn);
         }
         for retained in self.retained_calls.values_mut() {
             if retained.runtime_cell_id.as_ref() == Some(cell_id) {
                 retained.complete = false;
-                retained.clear_late_truncated_metadata();
+                retained.invalidate_output(&self.body_turn);
             }
         }
     }
@@ -400,7 +450,6 @@ impl ExecutedToolCalls {
             }))),
             retained_direct_metadata_bytes: Arc::new(AtomicUsize::new(0)),
             pending_direct_calls: Arc::new(AtomicUsize::new(0)),
-            mcp_attribution: mcp_attribution::McpAttributionRecorder::new(history),
         }
     }
 
@@ -425,7 +474,8 @@ impl ExecutedToolCalls {
         let info = turn.provider.info();
         // The built-in provider declares optional organization/project selectors. The
         // transport checks the resolved headers again and declines either active selector.
-        if info.is_amazon_bedrock()
+        if !info.include_internal_metadata
+            || info.is_amazon_bedrock()
             || info.is_gcp()
             || !provider_uses_first_party_auth_path(info)
             || info.gateway_oauth.is_some()
@@ -440,9 +490,15 @@ impl ExecutedToolCalls {
             || info
                 .http_headers
                 .iter()
-                .flat_map(HashMap::keys)
-                .chain(info.env_http_headers.iter().flat_map(HashMap::keys))
-                .any(|name| {
+                .flatten()
+                .map(|(name, value)| (name, Some(value.as_str())))
+                .chain(
+                    info.env_http_headers
+                        .iter()
+                        .flatten()
+                        .map(|(name, _)| (name, None)),
+                )
+                .any(|(name, _static_value)| {
                     !Self::is_result_body_provider_header(name)
                         && !name.eq_ignore_ascii_case(codex_client::OPENAI_ORGANIZATION_HEADER)
                         && !name.eq_ignore_ascii_case(codex_client::OPENAI_PROJECT_HEADER)
@@ -452,13 +508,13 @@ impl ExecutedToolCalls {
         }
         let owner = manager.auth_owner();
         let auth_mode = manager.auth_mode().filter(|_| owner.is_current())?;
-        if !matches!(auth_mode, AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens)
-            || !info
-                .base_url
-                .as_deref()
-                .is_none_or(crate::client::is_local_connector_result_gateway)
-        {
-            return None;
+        match auth_mode {
+            AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens
+                if info
+                    .base_url
+                    .as_deref()
+                    .is_none_or(crate::client::is_local_connector_result_gateway) => {}
+            _ => return None,
         }
         let capture = Arc::new(ResultBodyTurn {
             owner,
@@ -482,37 +538,25 @@ impl ExecutedToolCalls {
             .filter(|capture| capture.turn_id == turn_id)
     }
 
-    pub(super) fn capture_mcp_result(
+    fn current_result_turn(&self, turn: &TurnContext) -> Option<Arc<ResultBodyTurn>> {
+        self.result_body_turn(&turn.sub_id).filter(|capture| {
+            capture.is_current()
+                && capture
+                    .origin
+                    .ptr_eq(&Arc::downgrade(&turn.turn_metadata_state))
+        })
+    }
+
+    pub(super) fn start_mcp_result_capture<'a>(
         &self,
         turn: &TurnContext,
         call: &codex_mcp::PreparedMcpCall,
-        result: &CallToolResult,
-    ) -> Option<Arc<PendingResultBody>> {
-        let capture = self.result_body_turn(&turn.sub_id).filter(|capture| {
-            capture
-                .origin
-                .ptr_eq(&Arc::downgrade(&turn.turn_metadata_state))
-                && call.permits_result_body(capture.auth_mode)
-        })?;
-        PendingResultBody::record(&capture, result)
+        nested_call_id: Option<&'a str>,
+    ) -> Option<ResultBodyCapture<'a>> {
+        self.current_result_turn(turn)
+            .filter(|capture| call.permits_result_body(capture.auth_mode))?
+            .start_capture(nested_call_id)
     }
-
-    pub(crate) fn record_mcp_source(&self, source: McpAttributionSource) {
-        self.mcp_attribution.record(source);
-    }
-
-    pub(crate) fn mcp_attribution_snapshot(&self) -> McpAttribution {
-        self.mcp_attribution.snapshot()
-    }
-
-    pub(crate) fn mcp_attribution_checkpoint(&self, force: bool) -> Option<(McpAttribution, u64)> {
-        self.mcp_attribution.checkpoint(force)
-    }
-
-    pub(crate) fn mark_mcp_attribution_persisted(&self, revision: u64) {
-        self.mcp_attribution.mark_persisted(revision);
-    }
-
     /// Consult the inventory attached to this exact exec output during actor sampling.
     /// Pending cells can still produce other outputs and have no per-output inventory yet.
     pub(crate) fn exec_output_matches(
@@ -649,9 +693,20 @@ impl ExecutedToolCalls {
         &self,
         item: &mut ResponseItem,
         prepared: Option<(ExecutedToolCall, DirectCallPermit)>,
-        item_id_generator: &codex_protocol::ItemIdGenerator,
+        context_ids: &codex_thread_context_ids::ThreadContextIds,
     ) {
         let Some((mut call, permit)) = prepared else {
+            if self.captures_result_bodies
+                && let Some(state) = self.lock_state().as_mut()
+                && state.body_turn.strong_count() != 0
+                && let Some(id) = output_call_id(item).and_then(|id| state.output_cells.get(id))
+                && let Some(cell) = state.cells.get_mut(id)
+                && cell.truncated_metadata_binding_valid
+            {
+                // Bind nested results to the actual exec/wait output before history projection.
+                crate::session::assign_missing_item_id(item, context_ids);
+                cell.output_item_id = item.id().cloned();
+            }
             return;
         };
         let mut state = self.lock_state();
@@ -663,7 +718,7 @@ impl ExecutedToolCalls {
         {
             return;
         }
-        crate::session::assign_missing_item_id(item, item_id_generator);
+        crate::session::assign_missing_item_id(item, context_ids);
         let keep_live_call = !self.captures_result_bodies
             || state.direct_calls.len() < MAX_PENDING_EXECUTED_TOOL_CALLS
             || item
@@ -730,16 +785,24 @@ impl ExecutedToolCalls {
     pub(crate) fn record_accepted_result(
         &self,
         source: &ToolCallSource,
-        call_id: &str,
+        call_id: &ToolCallId,
         result: &dyn ToolOutput,
     ) {
         if !matches!(source, ToolCallSource::CodeMode { .. }) {
             return;
         }
-        // Release the lock before calling the output's trait method.
-        let recording = self.lock_state().is_some();
-        if recording {
-            self.record_result_metadata(source, call_id, result.tool_result_metadata());
+        // Release the recorder lock before reading the output. Only refund this turn on failure.
+        let Some(turn) = self
+            .lock_state()
+            .as_ref()
+            .map(|state| state.body_turn.clone())
+        else {
+            return;
+        };
+        let metadata = result.tool_result_metadata();
+        let id = metadata.result_id();
+        if !self.record_result_metadata(source, call_id, metadata) {
+            ResultBodyTurn::discard(&turn, id);
         }
     }
 
@@ -779,7 +842,7 @@ impl ExecutedToolCalls {
     fn record_nested_tool_call(
         &self,
         cell_id: CellId,
-        call_id: String,
+        call_id: ToolCallId,
         call: ExecutedToolCall,
         original_bytes: usize,
     ) {
@@ -791,7 +854,7 @@ impl ExecutedToolCalls {
         if !unique_nested_id {
             for retained in state.retained_calls.values_mut() {
                 if retained.truncated_call_index_by_id.contains_key(&call_id) {
-                    retained.clear_late_truncated_metadata();
+                    retained.clear_late_truncated_metadata(&state.body_turn);
                 }
             }
         }
@@ -815,7 +878,7 @@ impl ExecutedToolCalls {
         let cell = state.cells.entry(cell_id).or_default();
         let duplicate_call_id = cell.pending_calls.contains_key(&call_id);
         if !unique_nested_id || duplicate_call_id {
-            cell.truncated_metadata_binding_valid = false;
+            cell.invalidate_binding(&state.body_turn);
         }
         let call = if at_pending_call_limit {
             ExecutedToolCall::truncated(call.name, original_bytes, /*max_bytes*/ 0)
@@ -844,7 +907,7 @@ impl ExecutedToolCalls {
     fn record_result_metadata(
         &self,
         source: &ToolCallSource,
-        call_id: &str,
+        call_id: &ToolCallId,
         metadata: ToolResultMetadata,
     ) -> bool {
         let ToolCallSource::CodeMode { cell_id, .. } = source else {
@@ -857,12 +920,20 @@ impl ExecutedToolCalls {
         let Some(state) = state.as_mut() else {
             return false;
         };
-        let call = state
-            .cells
-            .get_mut(&CellId::new(cell_id.clone()))
-            .and_then(|cell| cell.pending_calls.get_mut(call_id));
-        if let Some(call) = call {
+        let turn = &state.body_turn;
+        let update = |call: &mut ExecutedToolCall, can_bind_body: bool| {
+            if call.tool_result_id() != metadata.result_id() {
+                ResultBodyTurn::discard(turn, call.tool_result_id());
+            }
             call.set_tool_result_metadata(metadata);
+            if !can_bind_body {
+                ResultBodyTurn::discard_call(turn, call);
+            }
+        };
+        if let Some(cell) = state.cells.get_mut(&CellId::new(cell_id.clone()))
+            && let Some(call) = cell.pending_calls.get_mut(call_id)
+        {
+            update(call, cell.truncated_metadata_binding_valid);
             return true;
         }
         let retained_call = state.retained_calls.values_mut().find_map(|retained| {
@@ -875,7 +946,10 @@ impl ExecutedToolCalls {
         if let Some((retained, index)) = retained_call {
             // Older retry copies must not overwrite this output's accepted result metadata.
             retained.result_metadata_updated = true;
-            retained.calls[index].set_tool_result_metadata(metadata);
+            update(
+                &mut retained.calls[index],
+                retained.output_item_id.is_some(),
+            );
             return true;
         }
         let mut candidates = state.retained_calls.values_mut().filter_map(|retained| {
@@ -893,7 +967,10 @@ impl ExecutedToolCalls {
         }
         retained.late_truncated_indices.insert(index);
         retained.result_metadata_updated = true;
-        retained.calls[index].set_tool_result_metadata(metadata);
+        update(
+            &mut retained.calls[index],
+            retained.output_item_id.is_some(),
+        );
         true
     }
 

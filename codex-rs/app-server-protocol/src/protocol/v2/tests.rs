@@ -334,6 +334,7 @@ fn thread_resume_response_round_trips_initial_turns_page() {
             git_info: None,
             name: None,
             daybreak_enabled: None,
+            daybreak_program_propagation_enrolled: None,
             turns: Vec::new(),
         },
         model: "gpt-5".to_string(),
@@ -1271,6 +1272,7 @@ fn fs_get_metadata_response_round_trips_minimal_fields() {
         is_symlink: false,
         created_at_ms: 123,
         modified_at_ms: 456,
+        size_bytes: Some(5),
     };
 
     let value = serde_json::to_value(&response).expect("serialize fs/getMetadata response");
@@ -1282,12 +1284,28 @@ fn fs_get_metadata_response_round_trips_minimal_fields() {
             "isSymlink": false,
             "createdAtMs": 123,
             "modifiedAtMs": 456,
+            "sizeBytes": 5,
         })
     );
 
-    let decoded = serde_json::from_value::<FsGetMetadataResponse>(value)
+    let decoded = serde_json::from_value::<FsGetMetadataResponse>(value.clone())
         .expect("deserialize fs/getMetadata response");
     assert_eq!(decoded, response);
+
+    let mut legacy_value = value;
+    legacy_value
+        .as_object_mut()
+        .expect("metadata object")
+        .remove("sizeBytes");
+    let legacy = serde_json::from_value::<FsGetMetadataResponse>(legacy_value)
+        .expect("deserialize fs/getMetadata response from an older server");
+    assert_eq!(
+        legacy,
+        FsGetMetadataResponse {
+            size_bytes: None,
+            ..response
+        }
+    );
 }
 
 #[test]
@@ -2134,7 +2152,6 @@ fn config_granular_approval_policy_is_marked_experimental() {
         forced_chatgpt_workspace_id: None,
         forced_login_method: None,
         web_search: None,
-        client_search_provider: None,
         tools: None,
         instructions: None,
         developer_instructions: None,
@@ -2170,7 +2187,6 @@ fn config_approvals_reviewer_is_marked_experimental() {
         forced_chatgpt_workspace_id: None,
         forced_login_method: None,
         web_search: None,
-        client_search_provider: None,
         tools: None,
         instructions: None,
         developer_instructions: None,
@@ -5360,6 +5376,76 @@ fn turn_start_params_preserve_explicit_null_service_tier() {
     let serialized_without_override =
         serde_json::to_value(&without_override).expect("params should serialize");
     assert_eq!(serialized_without_override.get("serviceTier"), None);
+}
+
+#[test]
+fn model_access_programs_preserve_availability_across_wire_formats() {
+    use codex_protocol::openai_models::ModelAccessPrograms as CoreModelAccessPrograms;
+
+    for (core_availability, app_server_availability, normalized_availability) in [
+        (json!("available"), json!("available"), json!("available")),
+        (
+            json!("enrollment_required"),
+            json!("enrollmentRequired"),
+            json!("enrollmentRequired"),
+        ),
+        (
+            json!("unavailable_for_model"),
+            json!("unavailableForModel"),
+            json!("unavailableForModel"),
+        ),
+        (json!("default"), json!("default"), json!("default")),
+        (
+            json!("future_status"),
+            json!("futureStatus"),
+            json!("default"),
+        ),
+    ] {
+        let core: CoreModelAccessPrograms = serde_json::from_value(json!({
+            "cyber": ["standard", "daybreak_blue", "daybreak_red"],
+            "daybreak_availability": core_availability,
+        }))
+        .expect("catalog availability should deserialize");
+        let app_server: ModelAccessPrograms = serde_json::from_value(json!({
+            "cyber": ["standard", "daybreakBlue", "daybreakRed"],
+            "daybreakAvailability": app_server_availability,
+        }))
+        .expect("app-server availability should deserialize");
+
+        assert_eq!(ModelAccessPrograms::from(core.clone()), app_server);
+        assert_eq!(CoreModelAccessPrograms::from(app_server.clone()), core);
+        assert_eq!(
+            serde_json::to_value(app_server).expect("model access programs should serialize"),
+            json!({
+                "cyber": ["standard", "daybreakBlue", "daybreakRed"],
+                "daybreakAvailability": normalized_availability,
+            }),
+        );
+    }
+
+    let legacy_core: CoreModelAccessPrograms = serde_json::from_value(json!({
+        "cyber": ["standard", "daybreak_blue"],
+    }))
+    .expect("old catalog metadata should deserialize");
+    let legacy_app_server: ModelAccessPrograms = serde_json::from_value(json!({
+        "cyber": ["standard", "daybreakBlue"],
+    }))
+    .expect("old app-server metadata should deserialize");
+    assert_eq!(
+        ModelAccessPrograms::from(legacy_core.clone()),
+        legacy_app_server,
+    );
+    assert_eq!(
+        CoreModelAccessPrograms::from(legacy_app_server.clone()),
+        legacy_core
+    );
+    assert_eq!(
+        serde_json::to_value(legacy_app_server).expect("legacy programs should serialize"),
+        json!({
+            "cyber": ["standard", "daybreakBlue"],
+            "daybreakAvailability": "default",
+        }),
+    );
 }
 
 #[test]

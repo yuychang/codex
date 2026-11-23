@@ -10,6 +10,7 @@ use crate::app::WindowsSandboxHost;
 use crate::app_event::ManagedWorktreeMode;
 use crate::app_event::ThreadGoalSetMode;
 use crate::bottom_pane::prompt_args::parse_slash_name;
+use crate::bottom_pane::prompt_args::slash_args_elements;
 use crate::bottom_pane::slash_commands::BuiltinCommandFlags;
 use crate::bottom_pane::slash_commands::ServiceTierCommand;
 use crate::bottom_pane::slash_commands::SlashCommandItem;
@@ -586,7 +587,10 @@ impl ChatWidget {
                 self.open_status_line_setup();
             }
             SlashCommand::Config => {
+                self.config_panel_reasoning_summary = None;
                 self.open_config_panel();
+                self.app_event_tx
+                    .send(AppEvent::RefreshConfigReasoningSummary);
             }
             SlashCommand::Theme => {
                 self.open_theme_picker();
@@ -885,11 +889,9 @@ impl ChatWidget {
                         let (name, environment_id) = if name.split_whitespace().any(|word| {
                             word == "--environment" || word.starts_with("--environment=")
                         }) {
-                            let args = match super::slash_command_args::parse(
+                            let args = match super::slash_command_args::parse_settings(
                                 name,
-                                &["--environment"],
-                                &[],
-                                &[],
+                                SlashCommand::Mcp,
                             ) {
                                 Ok(args) => args,
                                 Err(error) => {
@@ -1267,11 +1269,8 @@ impl ChatWidget {
         let trimmed_start = rest.trim_start();
         let leading_trimmed = rest.len().saturating_sub(trimmed_start.len());
         let trimmed_rest = trimmed_start.trim_end();
-        let args_elements = Self::slash_command_args_elements(
-            trimmed_rest,
-            rest_offset + leading_trimmed,
-            &text_elements,
-        );
+        let args_elements =
+            slash_args_elements(trimmed_rest, rest_offset + leading_trimmed, &text_elements);
         self.dispatch_prepared_command_with_args(
             cmd,
             PreparedSlashCommandArgs {
@@ -1405,31 +1404,6 @@ impl ChatWidget {
             | SlashCommand::Tui
             | SlashCommand::Pets => QueueDrain::Stop,
         }
-    }
-
-    fn slash_command_args_elements(
-        rest: &str,
-        rest_offset: usize,
-        text_elements: &[TextElement],
-    ) -> Vec<TextElement> {
-        if rest.is_empty() || text_elements.is_empty() {
-            return Vec::new();
-        }
-        text_elements
-            .iter()
-            .filter_map(|elem| {
-                if elem.byte_range.end <= rest_offset {
-                    return None;
-                }
-                let start = elem.byte_range.start.saturating_sub(rest_offset);
-                let mut end = elem.byte_range.end.saturating_sub(rest_offset);
-                if start >= rest.len() {
-                    return None;
-                }
-                end = end.min(rest.len());
-                (start < end).then_some(elem.map_range(|_| ByteRange { start, end }))
-            })
-            .collect()
     }
 
     fn ensure_slash_command_allowed_in_side_conversation(&mut self, cmd: SlashCommand) -> bool {

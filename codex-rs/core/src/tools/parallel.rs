@@ -39,13 +39,14 @@ use codex_extension_api::ToolCallOutcome;
 use codex_history::ResponseItemEnvelope;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
+use codex_tool_call_id::ToolCallId;
 
 struct ToolCallTimingGuard {
     started_at: Option<Instant>,
     call_state: Arc<ToolCallState>,
     conversation_id: String,
     turn_id: String,
-    call_id: String,
+    call_id: ToolCallId,
     tool_name: codex_tools::ToolName,
     extensions: Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>>,
 }
@@ -158,7 +159,7 @@ impl ToolCallRuntime {
             .features
             .enabled(codex_features::Feature::FileBackedToolAudio);
         let recorder = self.session.services.executed_tool_calls.clone();
-        let item_id_generator = Arc::clone(&self.session.item_id_generator);
+        let context_ids = self.session.context_ids.clone();
         let recorded_call = recorder.prepare_direct_call(&call, &source, &self.step_context);
         let step_context = Arc::clone(&self.step_context);
         let call_state = Arc::new(ToolCallState::default());
@@ -191,11 +192,7 @@ impl ToolCallRuntime {
                     .get_or_insert_default()
                     .delivered_assistant_message = Some(text.clone());
             }
-            recorder.attach_direct_call_to_output(
-                &mut response.item,
-                recorded_call,
-                &item_id_generator,
-            );
+            recorder.attach_direct_call_to_output(&mut response.item, recorded_call, &context_ids);
             Ok(response)
         }
     }
@@ -500,15 +497,16 @@ impl ToolCallRuntime {
 
     fn failure_response(call: ToolCall, err: FunctionCallError) -> ResponseInputItem {
         let message = err.to_string();
+        let call_id = call.call_id.into();
         match call.payload {
             ToolPayload::ToolSearch { .. } => ResponseInputItem::ToolSearchOutput {
-                call_id: call.call_id,
+                call_id,
                 status: "completed".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
             },
             ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
-                call_id: call.call_id,
+                call_id,
                 name: None,
                 output: codex_protocol::models::FunctionCallOutputPayload {
                     body: codex_protocol::models::FunctionCallOutputBody::Text(message),
@@ -516,7 +514,7 @@ impl ToolCallRuntime {
                 },
             },
             _ => ResponseInputItem::FunctionCallOutput {
-                call_id: call.call_id,
+                call_id,
                 output: codex_protocol::models::FunctionCallOutputPayload {
                     body: codex_protocol::models::FunctionCallOutputBody::Text(message),
                     success: Some(false),
@@ -738,7 +736,7 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let call = ToolCall {
                 tool_name: codex_tools::ToolName::plain("test_tool"),
-                call_id: "call-1".to_string(),
+                call_id: "call-1".into(),
                 payload: ToolPayload::Function {
                     arguments: "{}".to_string(),
                 },
@@ -793,7 +791,7 @@ mod tests {
         tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
             let call = ToolCall {
                 tool_name: codex_tools::ToolName::plain("exec"),
-                call_id: "call-1".to_string(),
+                call_id: "call-1".into(),
                 payload: ToolPayload::Custom {
                     input: "text('ready')".to_string(),
                 },
@@ -916,7 +914,7 @@ mod tests {
         let cancellation_token = CancellationToken::new();
         let call = ToolCall {
             tool_name,
-            call_id: "call-1".to_string(),
+            call_id: "call-1".into(),
             payload: ToolPayload::Function {
                 arguments: "{}".to_string(),
             },
@@ -1122,7 +1120,7 @@ mod tests {
         let cancellation_token = CancellationToken::new();
         let call = ToolCall {
             tool_name,
-            call_id: "call-1".to_string(),
+            call_id: "call-1".into(),
             payload: ToolPayload::Function {
                 arguments: "{}".to_string(),
             },
@@ -1132,11 +1130,11 @@ mod tests {
 
         let queued_call = ToolCall {
             tool_name: queued_name,
-            call_id: "call-2".to_string(),
+            call_id: "call-2".into(),
             ..call.clone()
         };
         let held_call = ToolCall {
-            call_id: "held-at-start".to_string(),
+            call_id: "held-at-start".into(),
             ..call.clone()
         };
         let response = runtime
@@ -1154,7 +1152,7 @@ mod tests {
         let gate = Arc::clone(&queued_runtime.parallel_execution);
         assert!(gate.try_read().is_ok());
         let expected_abort = ResponseInputItem::FunctionCallOutput {
-            call_id: queued_call.call_id.clone(),
+            call_id: queued_call.call_id.to_string(),
             output: FunctionCallOutputPayload {
                 body: FunctionCallOutputBody::Text("aborted before dispatch".to_string()),
                 success: None,

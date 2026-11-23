@@ -200,6 +200,7 @@ mod notifications;
 #[cfg(any(not(debug_assertions), test))]
 mod npm_registry;
 pub(crate) mod onboarding;
+mod open_in_codex;
 mod oss_selection;
 mod pager_overlay;
 mod projectless;
@@ -223,6 +224,7 @@ mod sidebar_image;
 mod sidebar_tab_strip;
 mod skills_helpers;
 mod slash_command;
+mod slash_command_settings;
 mod startup_draft;
 mod startup_error;
 mod startup_hooks_review;
@@ -240,6 +242,7 @@ mod subscription;
 mod system_motion;
 mod task_mentions;
 mod temporary_structured_request;
+mod terminal_capabilities;
 mod terminal_hyperlinks;
 mod terminal_palette;
 mod terminal_probe;
@@ -1259,6 +1262,17 @@ async fn run_ratatui_app(
         )
         .await
     };
+    if cli.resume_picker {
+        tui.draw(/*height*/ 1, |frame| {
+            frame.render_widget_ref(&resume_picker::loading_sessions_line(), frame.area());
+        })?;
+    }
+    let clear_inline_loading = |tui: &mut Tui| {
+        if cli.resume_picker && !tui.is_alt_screen_active() {
+            // Draw so the viewport follows the shell cursor after suspend/resume.
+            let _ = tui.draw(/*height*/ 0, |_| {});
+        }
+    };
     let startup_app_server = startup_draft
         .run_until(
             &mut tui,
@@ -1286,11 +1300,13 @@ async fn run_ratatui_app(
             .with_local_codex_home(&initial_config.codex_home)
         }
         Ok(Err(err)) => {
+            clear_inline_loading(&mut tui);
             terminal_restore_guard.restore_silently();
             session_log::log_session_end();
             return Err(err);
         }
         Err(err) => {
+            clear_inline_loading(&mut tui);
             terminal_restore_guard.restore_silently();
             session_log::log_session_end();
             return Err(err.into());
@@ -1317,6 +1333,7 @@ async fn run_ratatui_app(
                 );
             }
             Err(err) => {
+                clear_inline_loading(&mut tui);
                 shutdown_startup_session(Some(app_server_session), &mut terminal_restore_guard)
                     .await;
                 return Err(err.into());
@@ -1336,6 +1353,7 @@ async fn run_ratatui_app(
     let login_status = startup_draft
         .run_until(&mut tui, get_login_status(active_app_server))
         .await;
+    clear_inline_loading(&mut tui);
     let (login_status, mut startup_account) = match login_status {
         Ok(Ok((login_status, account))) => (login_status, Some(account)),
         Ok(Err(err)) => {
@@ -2051,6 +2069,14 @@ async fn run_ratatui_app(
                 trust_decision_was_made = true;
             }
         } else if consent.should_exit {
+            // Startup cannot return to the overview's reconnect loop until bootstrap completes.
+            if let codex_app_server_client::AppServerRequestHandle::Remote(handle) =
+                app_server.request_handle()
+                && handle.is_closed()
+            {
+                shutdown_startup_session(Some(app_server), &mut terminal_restore_guard).await;
+                color_eyre::eyre::bail!(onboarding::SETUP_CONNECTION_LOST);
+            }
             if !uses_remote_workspace {
                 config = load_config_or_exit_with_fallback_cwd(
                     cli_kv_overrides.clone(),

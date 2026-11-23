@@ -339,6 +339,7 @@ macro_rules! client_request_definitions {
         #[allow(clippy::large_enum_variant)]
         pub enum ClientResponsePayload {
             $( $variant($response), )*
+            FsReadFileBytes(v2::FsReadFileBytes),
             InterruptConversation(v1::InterruptConversationResponse),
         }
 
@@ -353,6 +354,10 @@ macro_rules! client_request_definitions {
                             })
                         }
                     )*
+                    Self::FsReadFileBytes(file) => Some(ClientResponse::FsReadFile {
+                        request_id,
+                        response: file.into(),
+                    }),
                     Self::InterruptConversation(_) => None,
                 }
             }
@@ -3389,6 +3394,7 @@ mod tests {
                     git_info: None,
                     name: None,
                     daybreak_enabled: None,
+                    daybreak_program_propagation_enrolled: None,
                     turns: Vec::new(),
                 },
                 model: "gpt-5".to_string(),
@@ -3452,6 +3458,7 @@ mod tests {
                         "gitInfo": null,
                         "name": null,
                         "daybreakEnabled": null,
+                        "daybreakProgramPropagationEnrolled": null,
                         "turns": []
                     },
                     "model": "gpt-5",

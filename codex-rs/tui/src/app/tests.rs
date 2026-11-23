@@ -94,12 +94,16 @@ mod recap_generation;
 #[path = "tests/resume_shutdown_tests.rs"]
 mod resume_shutdown_tests;
 mod safety_buffering;
+#[cfg(not(windows))]
+pub(super) use safety_buffering::wait_for_turn_completed;
 #[path = "tests/saved_chat_loading_tests.rs"]
 mod saved_chat_loading;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
 #[path = "tests/side_chat_policy_tests.rs"]
 mod side_chat_policy_tests;
+#[path = "tests/sidebar_chooser_hover_tests.rs"]
+mod sidebar_chooser_hover_tests;
 mod startup;
 #[path = "tests/startup_frame_tests.rs"]
 mod startup_frame_tests;
@@ -4713,7 +4717,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         app.transcript_view.end_select_mode();
         let reopened = side_frame(&mut app, &mut tui, size)?;
         assert!(
-            reopened.contains(child_row) && reopened.contains("child draft!"),
+            reopened.contains("child-29") && reopened.contains("child draft!"),
             "{reopened}"
         );
         assert_eq!(
@@ -5390,7 +5394,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     let header = frame.lines().next().unwrap().split_once('│').unwrap().1;
     insta::assert_snapshot!(
         header.split_inclusive('×').take(2).collect::<String>(),
-        @" ☁︎ Investigate …×  ☁︎ Fix cache    ×"
+        @" ☁️  Investigate… ×   ☁️  Fix cache    ×"
     );
     keys!(prefix, chooser_key);
     let frame = side_frame(&mut app, &mut tui, even)?;
@@ -5400,12 +5404,12 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         .filter_map(|line| line.split_once('│').map(|(_, pane)| pane))
         .filter(|pane| pane.contains("Investigate rendering") || pane.contains("Fix cache"))
         .map(|pane| pane.trim().trim_start_matches(['›', '○', ' ']))
-        .filter(|pane| pane.starts_with("☁︎"))
+        .filter(|pane| pane.starts_with("☁️"))
         .collect::<Vec<_>>()
         .join("\n");
     insta::assert_snapshot!(labels, @"
-    ☁︎ Investigate rendering
-    ☁︎ Fix cache
+    ☁️  Investigate rendering
+    ☁️  Fix cache
     ");
     keys!(KeyCode::Enter.into());
     app.backend_registry = local_registry;
@@ -5578,7 +5582,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
             .collect::<Vec<_>>()
             .try_into()
             .expect("both side-chat tabs are visible");
-        assert_eq!(selected.x, inactive.right() + 2);
+        assert_eq!(selected.x, inactive.right() + 4);
         assert_eq!(inactive.width, selected.width);
         let [inactive, selected] = [inactive, selected].map(|area| area.x + 1);
         for (state, column, row, palette, redraw) in [
@@ -5676,11 +5680,17 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
     let close_x = (chooser.x..chooser.right())
         .rfind(|&x| tui.terminal.previous_buffer()[(x, chooser.y)].symbol() == "×")
         .expect("close button on the second tab");
+    let hover = mouse(MouseEventKind::Moved, close_x - 1, chooser.y);
+    boxed_future!(app.handle_tui_event(&mut tui, &mut app_server, hover)).await?;
+    side_frame(&mut app, &mut tui, even)?;
+    let buffer = tui.terminal.previous_buffer();
+    let style = |x| buffer[(x, chooser.y)].style();
+    assert_eq!([close_x - 1, close_x + 1].map(style), [style(close_x); 2]);
     for kind in [down, release] {
         boxed_future!(app.handle_tui_event(
             &mut tui,
             &mut app_server,
-            mouse(kind, close_x, chooser.y)
+            mouse(kind, close_x + 1, chooser.y)
         ))
         .await?;
     }
@@ -5700,7 +5710,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         boxed_future!(app.handle_tui_event(
             &mut tui,
             &mut app_server,
-            mouse(kind, close_x - 1, chooser.y)
+            mouse(kind, close_x - 2, chooser.y)
         ))
         .await?;
     }
@@ -5726,7 +5736,7 @@ async fn handle_start_side_seeds_navigation_before_thread_started() -> Result<()
         boxed_future!(app.handle_tui_event(
             &mut tui,
             &mut app_server,
-            mouse(kind, close_x, chooser.y)
+            mouse(kind, close_x - 1, chooser.y)
         ))
         .await?;
     }
@@ -7564,6 +7574,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
     let mut model = crate::test_support::TEST_MODEL_PRESETS[0].clone();
     model.model = "gpt-agent".into();
     model.available_access_programs = Some(codex_protocol::openai_models::ModelAccessPrograms {
+        daybreak_availability: Default::default(),
         cyber: vec![codex_protocol::turn_input::CyberAccessProgram::DaybreakBlue],
     });
     crate::chatwidget::tests::helpers::set_test_model_catalog(&mut app.chat_widget, vec![model]);
@@ -7627,6 +7638,7 @@ async fn inactive_thread_started_notification_initializes_replay_session() -> Re
                 section_entered_at: None,
                 project_id: None,
                 daybreak_enabled: Some(true),
+                daybreak_program_propagation_enrolled: None,
                 history_mode: Default::default(),
                 model_provider: "openai".to_string(),
                 model: Some("gpt-agent".to_string()),
@@ -7747,6 +7759,7 @@ async fn inactive_thread_started_notification_preserves_primary_model_when_path_
                 section_entered_at: None,
                 project_id: None,
                 daybreak_enabled: None,
+                daybreak_program_propagation_enrolled: None,
                 history_mode: Default::default(),
                 model_provider: "agent-provider".to_string(),
                 model: None,
@@ -7822,6 +7835,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
         section_entered_at: None,
         project_id: None,
         daybreak_enabled: None,
+        daybreak_program_propagation_enrolled: None,
         history_mode: Default::default(),
         model_provider: "read-provider".to_string(),
         model: Some("server-reported-model".to_string()),
@@ -9189,6 +9203,7 @@ async fn make_test_app() -> Box<App> {
         statusline_picker: None,
         statusline_metrics: Default::default(),
         provider_writes: HashMap::new(),
+        realtime_call_client: Arc::default(),
         feature_write_lock: Arc::default(),
         config_notification_test_generation: 0,
         config_notification_test_pending: None,
@@ -9230,6 +9245,7 @@ async fn make_test_app() -> Box<App> {
         transcript_reflow: TranscriptReflowState::default(),
         initial_history_replay_buffer: None,
         pending_thread_switch_resets: 0,
+        pending_input_drain: None,
         scrollback_has_older_history: false,
         enhanced_keys_supported: false,
         keymap: crate::keymap::RuntimeKeymap::defaults(),
@@ -9278,6 +9294,7 @@ async fn make_test_app() -> Box<App> {
         side_threads: HashMap::new(),
         saved_openings: Default::default(),
         sidebars: HashMap::new(),
+        model_preview_load: None,
         side_companions: HashMap::new(),
         zoomed_thread: None,
         exact_sidebar_width: None,
@@ -9336,6 +9353,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             statusline_picker: None,
             statusline_metrics: Default::default(),
             provider_writes: HashMap::new(),
+            realtime_call_client: Arc::default(),
             feature_write_lock: Arc::default(),
             config_notification_test_generation: 0,
             config_notification_test_pending: None,
@@ -9377,6 +9395,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             transcript_reflow: TranscriptReflowState::default(),
             initial_history_replay_buffer: None,
             pending_thread_switch_resets: 0,
+            pending_input_drain: None,
             scrollback_has_older_history: false,
             enhanced_keys_supported: false,
             keymap: crate::keymap::RuntimeKeymap::defaults(),
@@ -9425,6 +9444,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             side_threads: HashMap::new(),
             saved_openings: Default::default(),
             sidebars: HashMap::new(),
+            model_preview_load: None,
             side_companions: HashMap::new(),
             zoomed_thread: None,
             exact_sidebar_width: None,
@@ -10257,6 +10277,7 @@ async fn directive_only_completion_removes_streamed_directive() -> Result<()> {
     app.handle_consolidate_agent_message(
         &mut tui,
         AgentMarkdownCell::new(String::new(), Path::new("/tmp")),
+        /*emitted_cells*/ 1,
         ConsolidationScrollbackReflow::Required,
         /*deferred_history_cell*/ None,
     )?;
@@ -10304,6 +10325,7 @@ async fn required_stream_reflow_during_capped_initial_replay_survives_transcript
                 .into(),
             Path::new("/tmp"),
         ),
+        /*emitted_cells*/ 1,
         ConsolidationScrollbackReflow::Required,
         /*deferred_history_cell*/ None,
     )?;

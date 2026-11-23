@@ -244,7 +244,7 @@ async fn document_preview_scenario() -> Result<()> {
     side_frame(&mut app, &mut tui, size)?;
     let sidebar = app.conversation_frame.panel_area().expect("document panel");
     let footer = visible_sidebar_row(&tui, sidebar, sidebar.bottom() - 1);
-    insta::assert_snapshot!(footer, @"v mark · enter/q close");
+    insta::assert_snapshot!(footer, @"m mark paragraph · q close");
     for key in [KeyCode::Char('v'), KeyCode::Right] {
         Box::pin(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(key.into()))).await?;
     }
@@ -406,6 +406,8 @@ async fn document_preview_scenario() -> Result<()> {
     )
     .await?;
     Box::pin(app.handle_event(&mut tui, &mut server, next_document_event(true).await)).await?;
+    // A closed tab can cancel its read. Hold an already completed result to test late dispatch.
+    let closed_document_result = next_document_event(false).await;
     Box::pin(app.handle_tui_event(&mut tui, &mut server, TuiEvent::Key(KeyCode::Esc.into())))
         .await?;
     Box::pin(app.handle_tui_event(
@@ -418,7 +420,7 @@ async fn document_preview_scenario() -> Result<()> {
         )),
     ))
     .await?;
-    Box::pin(app.handle_event(&mut tui, &mut server, next_document_event(false).await)).await?;
+    Box::pin(app.handle_event(&mut tui, &mut server, closed_document_result)).await?;
     assert_eq!(app.sidebar().unwrap().documents.len(), 1);
     std::fs::write(
         dir.path().join("main.rs"),
@@ -462,7 +464,7 @@ async fn document_preview_scenario() -> Result<()> {
         .collect::<Vec<_>>()
         .join("\n");
     insta::assert_snapshot!(preview, @"
-    guide.md      ×  main.rs       ×                              +
+    guide.md       ×   main.rs        ×                           +
     3 let value = 3;                                               ↑
     ↑/↓ read · f3 find · Tab link · f8 select · Esc clear highlight
     ");
@@ -647,10 +649,14 @@ size 123
         .sidebar_tab_strip()
         .expect("tab strip");
     let narrow_labels = visible_sidebar_row(&tui, strip, strip.y);
-    insta::assert_snapshot!(narrow_labels, @"‹  fe…eA/g…md×  fe…eB/g…md×   +");
+    insta::assert_snapshot!(narrow_labels, @"‹  f…eA/g…d ×   f…eB/g…d ×    +");
+    let long_file = "Before the fold.\n\n".repeat(24);
     for directory in ["feature-alpha-build", "feature-beta-build"] {
         std::fs::create_dir_all(dir.path().join(directory))?;
-        std::fs::write(dir.path().join(directory).join("guide.md"), "# Guide")?;
+        std::fs::write(
+            dir.path().join(directory).join("guide.md"),
+            format!("{long_file}Original ending."),
+        )?;
         Box::pin(app.open_document(
             &mut tui,
             &mut server,
@@ -670,7 +676,7 @@ size 123
         .sidebar_tab_strip()
         .expect("tab strip");
     let narrow_labels = visible_sidebar_row(&tui, strip, strip.y);
-    insta::assert_snapshot!(narrow_labels, @"‹  1:f…ld/g…d×  2:f…ld/g…d×   +");
+    insta::assert_snapshot!(narrow_labels, @"‹  1:f…d/…d ×   2:f…d/…d ×    +");
     // If resolution itself fails, there is no new tab in which to show the path.
     let tab_count = app.sidebar().unwrap().documents.len();
     app.open_document(
@@ -689,6 +695,56 @@ size 123
         matches!(event, AppEvent::InsertHistoryCell(cell) if cell.display_lines(/*width*/ 120).iter()
             .any(|line| line.to_string().contains("Could not open ~/notes.md:")))
     }));
+
+    // Replace the file like an editor doing an atomic save. The new last line should
+    // appear in the still-open tab without reopening the file or jumping to the top.
+    app.sidebar_mut()
+        .active_document()
+        .unwrap()
+        .reader()
+        .unwrap()
+        .0
+        .jump_to_latest();
+    assert!(side_frame(&mut app, &mut tui, size)?.contains("Original ending."));
+    let mut wait_for_preview =
+        async |app: &mut App, tui: &mut tui::Tui, server: &mut AppServerSession, text: &str| {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    tokio::select! {
+                        Some(event) = server.next_event() => {
+                            Box::pin(app.handle_app_server_event(server, event.event)).await;
+                        }
+                        Some(event @ AppEvent::SidebarDocumentLoaded { .. }) = events.recv() => {
+                            Box::pin(app.handle_event(tui, server, event)).await?;
+                            if side_frame(app, tui, size)?.contains(text) {
+                                return Ok::<_, color_eyre::Report>(());
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("open preview did not show {text:?}"))
+        };
+    let directory = dir.path().join("feature-beta-build");
+    let saved = tempfile::NamedTempFile::new_in(dir.path())?;
+    std::fs::write(saved.path(), format!("{long_file}Updated ending."))?;
+    saved.persist(directory.join("guide.md"))?;
+    wait_for_preview(&mut app, &mut tui, &mut server, "Updated ending.").await?;
+
+    // Moving the whole folder makes the file unreadable; bringing it back must
+    // restore the scrolled reader, even after the intervening error frame.
+    let moved = dir.path().join("moved");
+    std::fs::rename(&directory, &moved)?;
+    wait_for_preview(&mut app, &mut tui, &mut server, "File not found").await?;
+    std::fs::rename(moved, directory)?;
+    wait_for_preview(&mut app, &mut tui, &mut server, "Updated ending.").await?;
+    let sidebar = app.conversation_frame.panel_area().expect("document panel");
+    let visible = (sidebar.y..sidebar.bottom())
+        .map(|row| visible_sidebar_row(&tui, sidebar, row))
+        .collect::<Vec<_>>()
+        .join("\n");
+    insta::assert_snapshot!("refreshed_sidebar_at_reading_position", visible);
     server.shutdown().await?;
     Ok(())
 }

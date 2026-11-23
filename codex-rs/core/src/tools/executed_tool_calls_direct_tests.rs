@@ -9,6 +9,7 @@ use codex_login::ExternalAuthRefreshContext;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
+use codex_thread_context_ids_test_support::thread_context_ids;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -38,7 +39,7 @@ fn capture_only_does_not_publish_general_direct_metadata_after_refresh() {
         recorder.attach_direct_call_to_output(
             &mut item,
             Some((call.clone(), permit)),
-            &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
+            &thread_context_ids(),
         );
         if enabled {
             assert_eq!(
@@ -69,7 +70,7 @@ fn direct_request_uses_live_window_after_persisted_budget_is_exhausted() {
         recorder.attach_direct_call_to_output(
             &mut item,
             Some((call, recorder.reserve_direct_call().unwrap())),
-            &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
+            &thread_context_ids(),
         );
         item
     };
@@ -123,6 +124,57 @@ pub(super) async fn connector_result_turn() -> TurnContext {
         .enable(Feature::ConnectorToolResultPassthrough)
         .unwrap();
     turn
+}
+
+#[test_case::test_case(512; "shed on attach")]
+#[test_case::test_case(MAX_RETAINED_DIRECT_METADATA_BYTES; "pruned from sampling")]
+#[tokio::test]
+async fn direct_result_body_budget_reopens_when_the_output_is_lost(available: usize) {
+    let turn = connector_result_turn().await;
+    let recorder = ExecutedToolCalls::new(&turn.config.features, &InitialHistory::New);
+    let capture = recorder.begin_turn(&turn).unwrap();
+    recorder.retained_direct_metadata_bytes.store(
+        MAX_RETAINED_DIRECT_METADATA_BYTES - available,
+        Ordering::Relaxed,
+    );
+    let bodies = |items: &[ResponseItem]| {
+        capture.for_input(items, &turn.auth_manager.as_ref().unwrap().auth_owner())
+    };
+    // Each body fits by itself. Only the first call's larger arguments can force row shedding.
+    let result = serde_json::from_value(json!({
+        "content": [{"type": "text", "text": "x".repeat(600 * 1024)}]
+    }))
+    .unwrap();
+    let attach = |id: &str, args| {
+        let mut call = ExecutedToolCall::new("read".into(), args);
+        let body_id = capture
+            .start_capture(/*nested_call_id*/ None)
+            .and_then(|call| call.record(&result, |_| true))
+            .and_then(|pending| pending.accept())
+            .expect("room for the Direct body");
+        call.set_tool_result_metadata(ToolResultMetadata::default().with_result_id(Some(body_id)));
+        let mut item = output(id);
+        recorder.attach_direct_call_to_output(
+            &mut item,
+            Some((call, recorder.reserve_direct_call().unwrap())),
+            &thread_context_ids(),
+        );
+        item
+    };
+    let mut first = [attach("first", json!({"argument": "x".repeat(1024)}))];
+    if available == MAX_RETAINED_DIRECT_METADATA_BYTES {
+        recorder.attach_to_compaction_prompt(&mut []);
+        recorder.attach_to_prompt(&mut first, &mut HashMap::new());
+        assert!(matches!(bodies(&first).as_slice(), [(0, 0, _)]));
+        recorder.attach_to_prompt(&mut [], &mut HashMap::new());
+    } else {
+        assert!(first[0].executed_tool_call_metadata().is_none());
+    }
+
+    let [first] = first;
+    let mut retry = [first, attach("second", json!({}))];
+    recorder.attach_to_prompt(&mut retry, &mut HashMap::new());
+    assert!(matches!(bodies(&retry).as_slice(), [(1, 0, _)]));
 }
 
 #[test_case::test_case(1, 600 * 1024; "byte limit")]
@@ -191,13 +243,18 @@ async fn direct_result_bodies_require_the_originating_output_turn_and_owner(
     let attach = |id: &str| {
         let mut call = ExecutedToolCall::new("read".into(), json!({"id": id}));
         call.set_tool_result_metadata(
-            ToolResultMetadata::new(&metadata).with_result_id(capture.record(&result)),
+            ToolResultMetadata::new(&metadata).with_result_id(
+                capture
+                    .start_capture(/*nested_call_id*/ None)
+                    .and_then(|call| call.record(&result, |_| true))
+                    .and_then(|pending| pending.accept()),
+            ),
         );
         let mut item = output(id);
         recorder.attach_direct_call_to_output(
             &mut item,
             Some((call, recorder.reserve_direct_call().unwrap())),
-            &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
+            &thread_context_ids(),
         );
         item
     };
@@ -302,7 +359,7 @@ fn direct_metadata_follows_output_ids_with_reused_call_ids_and_reverse_completio
             recorder.attach_direct_call_to_output(
                 &mut outputs[index],
                 prepared[index].take(),
-                &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
+                &thread_context_ids(),
             );
             assert!(outputs[index].executed_tool_call_metadata().is_none());
             if supplied_ids {
@@ -365,7 +422,7 @@ fn direct_budget_keeps_an_omission_marker_when_it_fits() {
         recorder.attach_direct_call_to_output(
             &mut item,
             Some((call, recorder.reserve_direct_call().unwrap())),
-            &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
+            &thread_context_ids(),
         );
 
         expected.set_id(item.id().cloned());
@@ -388,7 +445,7 @@ async fn direct_pending_limit_releases_on_completion_or_dropped_future() {
     let recorder = ExecutedToolCalls::new(&features, &InitialHistory::New);
     let call = ToolCall {
         tool_name: codex_tools::ToolName::plain("test_tool"),
-        call_id: "direct".to_string(),
+        call_id: "direct".into(),
         payload: ToolPayload::Function {
             arguments: json!({ "argument": "kept" }).to_string(),
         },
@@ -404,11 +461,7 @@ async fn direct_pending_limit_releases_on_completion_or_dropped_future() {
     let cloned = recorder.clone();
     let mut overflow = output("overflow");
     let before = serde_json::to_value(&overflow).expect("serializable output");
-    cloned.attach_direct_call_to_output(
-        &mut overflow,
-        prepare(&cloned),
-        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
-    );
+    cloned.attach_direct_call_to_output(&mut overflow, prepare(&cloned), &thread_context_ids());
     assert_eq!(
         serde_json::to_value(&overflow).expect("serializable output"),
         before,
@@ -425,11 +478,7 @@ async fn direct_pending_limit_releases_on_completion_or_dropped_future() {
     assert!(prepare(&recorder).is_none());
 
     let mut completed = output("completed");
-    recorder.attach_direct_call_to_output(
-        &mut completed,
-        pending.pop(),
-        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
-    );
+    recorder.attach_direct_call_to_output(&mut completed, pending.pop(), &thread_context_ids());
     assert_eq!(
         completed
             .executed_tool_call_metadata()
@@ -442,11 +491,7 @@ async fn direct_pending_limit_releases_on_completion_or_dropped_future() {
     recorder.refresh(&features);
     assert!(prepare(&recorder).is_none());
     let mut stale = output("stale");
-    recorder.attach_direct_call_to_output(
-        &mut stale,
-        Some(replacement),
-        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
-    );
+    recorder.attach_direct_call_to_output(&mut stale, Some(replacement), &thread_context_ids());
     assert!(stale.id().is_none());
     assert!(stale.executed_tool_call_metadata().is_none());
     let current = prepare(&recorder).expect("stale call released its slot");
@@ -454,7 +499,7 @@ async fn direct_pending_limit_releases_on_completion_or_dropped_future() {
     recorder.attach_direct_call_to_output(
         &mut current_output,
         Some(current),
-        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
+        &thread_context_ids(),
     );
     assert_eq!(
         current_output
@@ -479,7 +524,7 @@ async fn direct_recording_preserves_encoded_arguments_in_history() {
     assert!(wire_bytes > 8 * 1024);
     let call = ToolCall {
         tool_name: codex_tools::ToolName::plain("test_tool"),
-        call_id: "direct".to_string(),
+        call_id: "direct".into(),
         payload: ToolPayload::Function {
             arguments: invalid_json.clone(),
         },
@@ -491,7 +536,7 @@ async fn direct_recording_preserves_encoded_arguments_in_history() {
     recorder.attach_direct_call_to_output(
         &mut item,
         recorder.prepare_direct_call(&call, &ToolCallSource::Direct, &step),
-        &codex_protocol_test_support::uuid_v7_item_id_generator_for_test(),
+        &thread_context_ids(),
     );
     let wire = serde_json::to_value(&item).unwrap();
     assert_eq!(wire["output"], ordinary_output);
