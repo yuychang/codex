@@ -790,12 +790,7 @@ impl ListSelectionView {
                         format!("{prefix}    {label}. ")
                     } else {
                         enabled_row_number += 1;
-                        if enabled_row_number <= 9 {
-                            format!("{prefix} {enabled_row_number}. ")
-                        } else {
-                            let number_width = enabled_row_number.to_string().len();
-                            format!("{prefix} {}", " ".repeat(number_width + 2))
-                        }
+                        format!("{prefix} {enabled_row_number}. ")
                     };
                     let wrap_prefix_width = UnicodeWidthStr::width(wrap_prefix.as_str());
                     let mut name_prefix_spans = Vec::new();
@@ -2891,7 +2886,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_shortcuts_stop_at_nine() {
+    fn automatic_numbering_continues_past_nine() {
         let (tx, _rx) = unbounded_channel();
         let mut view = new_view(
             SelectionViewParams {
@@ -2908,7 +2903,7 @@ mod tests {
         );
         let rows = view.build_rows();
         assert_eq!(rows[8].name_prefix_spans[0].content, "› 9. ");
-        assert_eq!(rows[9].name_prefix_spans[0].content, "      ");
+        assert_eq!(rows[9].name_prefix_spans[0].content, "  10. ");
         view.handle_key_event(KeyEvent::from(KeyCode::Down));
         view.handle_key_event(KeyEvent::from(KeyCode::Enter));
         assert_eq!(view.take_last_selected_index(), Some(9));
